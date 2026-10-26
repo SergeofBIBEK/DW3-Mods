@@ -704,15 +704,24 @@ local function attachPortrait(widget, marker, above, nudge)
     return placed
 end
 
+-- Measured once, when the combo line is first placed. A layout pass every
+-- frame was the battle hitch. Without that pass the height is short and the
+-- gold text sits on the drop name.
 local function lineHeight(widget)
     pcall(function() widget:ForceLayoutPrepass() end)
     local _, height = vec2(safe(function() return widget:GetDesiredSize() end, nil))
-    if height >= 4 then
-        return height
-    end
     local font = safe(function() return widget.Font end, nil)
     local size = font and tonumber(font.Size) or 12
-    return size
+    if size < 8 then
+        size = 12
+    end
+    if height >= size then
+        return height, true
+    end
+    if height >= 4 then
+        return math.max(height, size), false
+    end
+    return size, false
 end
 
 -- The drop stays centered under the portrait. The gold combo is centered
@@ -721,17 +730,20 @@ local function placeHintBelow(drop, hint)
     local dropSlot = drop.Slot
     local hintSlot = hint.Slot
     if not isLive(dropSlot) or not isLive(hintSlot) then
-        return
+        return false
     end
     local centerX, topY = vec2(dropSlot:GetPosition())
-    local step = lineHeight(drop)
+    local step, ready = lineHeight(drop)
+    local placed = false
     pcall(function()
         hintSlot:SetAutoSize(true)
         hintSlot:SetAlignment({ X = 0.5, Y = 0 })
         hintSlot:SetPosition({ X = centerX, Y = topY + step })
         local z = tonumber(safe(function() return dropSlot:GetZOrder() end, 0)) or 0
         hintSlot:SetZOrder(z + 1)
+        placed = true
     end)
+    return placed and ready
 end
 
 local function gaugePortrait(gauge)
@@ -765,8 +777,9 @@ end
 local function ensureComboText(gauge)
     clearStarNotes(gauge)
     if comboPlaced and isLive(comboText) and isLive(parentOf(comboText)) then
-        styleComboText(gauge, comboText)
-        placeComboText(gauge, comboText)
+        if not comboFontReady then
+            styleComboText(gauge, comboText)
+        end
         return comboText
     end
     comboPlaced = false
@@ -787,6 +800,12 @@ local function ensureComboText(gauge)
 end
 
 local function ensureComboHint(gauge)
+    if isLive(comboHintText) and isLive(parentOf(comboHintText)) then
+        if not comboHintFontReady then
+            styleHintText(gauge, comboHintText)
+        end
+        return comboHintText
+    end
     if not isLive(comboHintText) then
         local class = StaticFindObject("/Script/UMG.TextBlock")
         local widget = class and StaticConstructObject(class, gauge) or nil
@@ -1025,6 +1044,7 @@ local function restoreAllGauges()
 end
 
 local paneWatch = { key = nil, side = nil, follow = 0 }
+local hintAnchored = false
 
 local function paintCombo(gauge, combo, hintBox)
     pcall(function()
@@ -1091,7 +1111,9 @@ local function applyPane(label, hint, actorKey)
                 hintBox:SetVisibility(4)
                 hintBox:SetRenderOpacity(1)
             end)
-            placeHintBelow(combo, hintBox)
+            if comboPlaced and not hintAnchored and placeHintBelow(combo, hintBox) then
+                hintAnchored = true
+            end
         else
             if textOf(hintBox) ~= "" then
                 setWidgetText(hintBox, "")
@@ -1933,12 +1955,10 @@ local function answerFor(list, focus, name)
         infoAnswers[key] = slot
     end
     local card = textOf(name)
-    focus.rowGroup = focusedListGroup(card)
     local token = table.concat({
         card,
         tostring(focus.ally),
         tostring(focus.group),
-        tostring(focus.rowGroup),
         cacheStamp(),
     }, ":")
     local retry = slot.label == nil and not (slot.why and slot.why:find("blank", 1, true))
@@ -2212,9 +2232,32 @@ local function refreshInfoList(list)
     showInfoNote(note, entry, label, name)
 end
 
+local infoLists = nil
+local infoListsAt = -1000
+
 local function refreshInfo()
-    local all = FindAllOf("BP_battle_setup_info_unit_C") or {}
-    for _, list in ipairs(all) do
+    local now = os.clock()
+    local stale = not infoLists or now - infoListsAt > 2.0
+    if not stale then
+        for _, list in ipairs(infoLists) do
+            if not isLive(list) then
+                stale = true
+                break
+            end
+        end
+    end
+    if stale then
+        infoLists = {}
+        local all = FindAllOf("BP_battle_setup_info_unit_C") or {}
+        for _, list in ipairs(all) do
+            local full = safe(function() return list:GetFullName() end, "") or ""
+            if isLive(list) and not full:find("Default__", 1, true) then
+                infoLists[#infoLists + 1] = list
+            end
+        end
+        infoListsAt = now
+    end
+    for _, list in ipairs(infoLists) do
         local ok, err = pcall(refreshInfoList, list)
         if not ok and not infoFailed then
             infoFailed = true
@@ -2274,9 +2317,15 @@ local function ensureHooks()
     end
 end
 
+local restorePasses = 0
+
 local function refreshPane()
     ensureCache()
-    restoreAllGauges()
+    -- A few passes clear leftover notes. After that the live gauge is enough.
+    if restorePasses < 4 then
+        restoreAllGauges()
+        restorePasses = restorePasses + 1
+    end
     refreshLabel()
     refreshInfo()
     ensureHooks()
