@@ -1,8 +1,6 @@
 -- Drop Viewer
 -- Battle gauge: drop name under the officer portrait. A combo note (8+/16+/24+)
 -- sits on the next line, in the troop-line color, only when that drop can rise a tier.
--- Pause Unit Info: drop name only, above the portrait. This mod does not change
--- the officer name or unitname_ruby. Orders mods own that upper line.
 -- Assigned drops live on the AlgoManager record array.
 --   character +0x7A0 = record index
 --   character +0x7A4 = -1 when this actor emits that record
@@ -405,9 +403,10 @@ local comboHintText = nil
 local comboFontReady = false
 local comboHintFontReady = false
 local comboPlaced = false
+local hintPlaced = false
+local comboLineSize = nil
 local comboMissLogged = false
 local portraitMissLogged = false
-local infoOwned = {}
 local clearedStars = {}
 local starAttempts = {}
 local restoredPasses = {}
@@ -455,7 +454,8 @@ local function styleComboText(gauge, widget)
         local font = name.Font
         local size = font and tonumber(font.Size) or nil
         if size and size > 8 then
-            font.Size = math.floor(size * 0.55)
+            comboLineSize = math.floor(size * 0.55)
+            font.Size = comboLineSize
         end
         widget:SetFont(font)
         widget:SetColorAndOpacity(name.ColorAndOpacity)
@@ -653,7 +653,7 @@ local function portraitCanvas(marker)
     return nil, nil
 end
 
-local function attachPortrait(widget, marker, above, nudge)
+local function attachPortrait(widget, marker, above, nudge, extraY)
     if not isLive(widget) or not isLive(marker) then
         return false
     end
@@ -693,57 +693,16 @@ local function attachPortrait(widget, marker, above, nudge)
         slot:SetAutoSize(true)
         slot:SetAnchors(anchorSlot:GetAnchors())
         local shift = tonumber(nudge) or 0
+        local extra = tonumber(extraY) or 0
         slot:SetAlignment({ X = 0.5, Y = above and 1 or 0 })
         slot:SetPosition({
             X = left + sizeX * 0.5,
-            Y = above and (top - 4 + shift) or (top + sizeY + 4 - shift),
+            Y = (above and (top - 4 + shift) or (top + sizeY + 4 - shift)) + extra,
         })
         slot:SetZOrder((tonumber(safe(function() return anchorSlot:GetZOrder() end, 0)) or 0) + 5)
         placed = true
     end)
     return placed
-end
-
--- Measured once, when the combo line is first placed. A layout pass every
--- frame was the battle hitch. Without that pass the height is short and the
--- gold text sits on the drop name.
-local function lineHeight(widget)
-    pcall(function() widget:ForceLayoutPrepass() end)
-    local _, height = vec2(safe(function() return widget:GetDesiredSize() end, nil))
-    local font = safe(function() return widget.Font end, nil)
-    local size = font and tonumber(font.Size) or 12
-    if size < 8 then
-        size = 12
-    end
-    if height >= size then
-        return height, true
-    end
-    if height >= 4 then
-        return math.max(height, size), false
-    end
-    return size, false
-end
-
--- The drop stays centered under the portrait. The gold combo is centered
--- on the line below it.
-local function placeHintBelow(drop, hint)
-    local dropSlot = drop.Slot
-    local hintSlot = hint.Slot
-    if not isLive(dropSlot) or not isLive(hintSlot) then
-        return false
-    end
-    local centerX, topY = vec2(dropSlot:GetPosition())
-    local step, ready = lineHeight(drop)
-    local placed = false
-    pcall(function()
-        hintSlot:SetAutoSize(true)
-        hintSlot:SetAlignment({ X = 0.5, Y = 0 })
-        hintSlot:SetPosition({ X = centerX, Y = topY + step })
-        local z = tonumber(safe(function() return dropSlot:GetZOrder() end, 0)) or 0
-        hintSlot:SetZOrder(z + 1)
-        placed = true
-    end)
-    return placed and ready
 end
 
 local function gaugePortrait(gauge)
@@ -774,6 +733,41 @@ local function placeComboText(gauge, widget)
     return false
 end
 
+-- Same portrait slot as the drop, one combo-font below it, plus 8 pixels
+-- so the gold line clears the drop. Nothing is measured, and the combo is not
+-- parented until that step is known, so it cannot sit on the drop.
+local function lineStep(gauge)
+    if comboLineSize and comboLineSize >= 4 then
+        return comboLineSize
+    end
+    local name = isLive(gauge) and gauge.text_enemy_name or nil
+    local size = tonumber(safe(function()
+        if not isLive(name) then
+            return nil
+        end
+        return name.Font.Size
+    end, nil))
+    if size and size > 8 then
+        comboLineSize = math.floor(size * 0.55)
+    end
+    if comboLineSize and comboLineSize >= 4 then
+        return comboLineSize
+    end
+    return nil
+end
+
+local function placeComboHint(gauge, widget)
+    local step = lineStep(gauge)
+    if not step or not isLive(widget) then
+        return false
+    end
+    local portrait = gaugePortrait(gauge)
+    if not isLive(portrait) then
+        return false
+    end
+    return attachPortrait(widget, portrait, false, 8, step + 8)
+end
+
 local function ensureComboText(gauge)
     clearStarNotes(gauge)
     if comboPlaced and isLive(comboText) and isLive(parentOf(comboText)) then
@@ -800,12 +794,13 @@ local function ensureComboText(gauge)
 end
 
 local function ensureComboHint(gauge)
-    if isLive(comboHintText) and isLive(parentOf(comboHintText)) then
+    if hintPlaced and isLive(comboHintText) and isLive(parentOf(comboHintText)) then
         if not comboHintFontReady then
             styleHintText(gauge, comboHintText)
         end
         return comboHintText
     end
+    hintPlaced = false
     if not isLive(comboHintText) then
         local class = StaticFindObject("/Script/UMG.TextBlock")
         local widget = class and StaticConstructObject(class, gauge) or nil
@@ -815,7 +810,8 @@ local function ensureComboHint(gauge)
         comboHintText = widget
         comboHintFontReady = false
     end
-    if placeComboText(gauge, comboHintText) then
+    if placeComboHint(gauge, comboHintText) then
+        hintPlaced = true
         styleHintText(gauge, comboHintText)
     end
     return comboHintText
@@ -857,22 +853,6 @@ local function isOurNote(text)
     return false
 end
 
-local function nameHasInfoMark(text)
-    return type(text) == "string"
-        and (text:find("DropViewerInfo", 1, true) or text:find("UnitDropsInfo", 1, true))
-end
-
-local function isInfoMarker(widget)
-    if not isLive(widget) then
-        return false
-    end
-    if nameHasInfoMark(widgetClass(widget)) then
-        return true
-    end
-    local name = safe(function() return widget:GetName() end, "") or ""
-    return nameHasInfoMark(name)
-end
-
 local stalePasses = {}
 local staleLogged = false
 
@@ -888,9 +868,6 @@ local function removeStaleNotes(gauge)
     local seen = {}
     local function consider(widget)
         if not isLive(widget) or sameObject(widget, comboText) or sameObject(widget, comboHintText) or sameObject(widget, name) or sameObject(widget, force) then
-            return
-        end
-        if infoOwned[widgetKey(widget)] or isInfoMarker(widget) then
             return
         end
         if not widgetClass(widget):find("TextBlock", 1, true) then
@@ -1044,7 +1021,6 @@ local function restoreAllGauges()
 end
 
 local paneWatch = { key = nil, side = nil, follow = 0 }
-local hintAnchored = false
 
 local function paintCombo(gauge, combo, hintBox)
     pcall(function()
@@ -1111,9 +1087,6 @@ local function applyPane(label, hint, actorKey)
                 hintBox:SetVisibility(4)
                 hintBox:SetRenderOpacity(1)
             end)
-            if comboPlaced and not hintAnchored and placeHintBelow(combo, hintBox) then
-                hintAnchored = true
-            end
         else
             if textOf(hintBox) ~= "" then
                 setWidgetText(hintBox, "")
@@ -1185,1087 +1158,6 @@ local function refreshLabel()
     applyPane(label, hint, actorKey)
 end
 
--- Pause Unit Info. One TextBlock above the officer portrait, drop name only.
--- The line above the name is unitname_ruby. In-game Orders and Havie Unit
--- Orders write that line, including "Officer - Orders: ..." while a sub-officer
--- is highlighted and the card still shows the commander. This code never
--- changes UnitName or unitname_ruby, and the only widget it removes is an
--- older DropViewerInfo text left behind by Ctrl+R. A UnitDropsInfo
--- widget from the previous name is removed the same way.
-local infoFailed = false
-local infoFontLogged = false
-local infoLogs = 0
-local infoMissLogged = false
-local infoEntries = {}
-local infoAnswers = {}
-
-local function callInt(actor, method)
-    local value = safe(function() return actor[method](actor) end, nil)
-    if type(value) == "userdata" then
-        value = unwrap(value)
-    end
-    local n = asInt(value)
-    if n ~= nil then
-        return n
-    end
-    if type(value) == "string" then
-        return tonumber(value:match("(%d+)%s*$"))
-    end
-    return nil
-end
-
-local function fieldInt(obj, field)
-    if obj == nil then
-        return nil
-    end
-    local value = safe(function() return obj[field] end, nil)
-    if type(value) == "userdata" then
-        value = unwrap(value)
-    end
-    return asInt(value)
-end
-
-local function asBool(value)
-    if type(value) == "boolean" then
-        return value
-    end
-    if type(value) == "number" then
-        if value == 1 then
-            return true
-        end
-        if value == 0 then
-            return false
-        end
-    end
-    local text = tostring(value):lower()
-    if text == "true" then
-        return true
-    end
-    if text == "false" then
-        return false
-    end
-    return nil
-end
-
-local function readFocus(list)
-    local focus = safe(function() return list.FocusUnit end, nil)
-    local inner = focus
-    if type(focus) == "userdata" then
-        local got = safe(function()
-            if focus.get then
-                return focus:get()
-            end
-            return nil
-        end, nil)
-        if got ~= nil then
-            inner = got
-        end
-    end
-    local unit = fieldInt(inner, "UnitID")
-    if unit == nil and inner ~= focus then
-        unit = fieldInt(focus, "UnitID")
-        if unit ~= nil then
-            inner = focus
-        end
-    end
-    local group = fieldInt(inner, "GroupID")
-    local rank = fieldInt(inner, "Rank")
-    if unit == nil then
-        unit = fieldInt(list, "NowFocusUnit")
-    end
-    -- FocusUnit.GroupID stays -1 while the card shows a real officer.
-    -- NowFocusGroupID is the highlighted row's AlgoGroupID.
-    if group == nil or group < 0 then
-        local nowGroup = fieldInt(list, "NowFocusGroupID")
-        if nowGroup ~= nil and nowGroup >= 0 then
-            group = nowGroup
-        end
-    end
-    return {
-        unit = unit,
-        group = group,
-        rank = rank,
-        ally = asBool(safe(function() return list.IsNowFocusAlly end, nil)),
-    }
-end
-
-local function widgetShown(widget)
-    local vis = tonumber(safe(function() return widget:GetVisibility() end, nil))
-    if vis == nil then
-        return true
-    end
-    return vis ~= 1 and vis ~= 2
-end
-
-local function branchShown(widget)
-    local current = widget
-    for _ = 1, 6 do
-        if not isLive(current) then
-            break
-        end
-        if not widgetShown(current) then
-            return false
-        end
-        current = parentOf(current)
-    end
-    return true
-end
-
--- Officers stay spawned, so one pass covers a scroll through the unit list.
-local emitterScan = { at = -1000, rows = {} }
-
-local function emitterRows()
-    local now = os.clock()
-    if emitterScan.rows and now - emitterScan.at < 1.0 then
-        return emitterScan.rows
-    end
-    local rows = {}
-    local all = FindAllOf("AppCharacterBase") or {}
-    for _, actor in ipairs(all) do
-        if isLive(actor) and asInt(actor.DropOwnerGate) == -1 then
-            local full = safe(function() return actor:GetFullName() end, "") or ""
-            if not full:find("Default__", 1, true) then
-                rows[#rows + 1] = {
-                    actor = actor,
-                    unit = callInt(actor, "GetUnitTypeInt"),
-                    rank = callInt(actor, "GetUnitRankNum"),
-                    side = safe(function() return unwrap(actor:GetSide()) end, nil),
-                    index = asInt(actor.DropRecordIndex),
-                }
-            end
-        end
-    end
-    emitterScan.at = now
-    emitterScan.rows = rows
-    return rows
-end
-
-local function collectEmitters(unitId, rank, wantAlly, useRank, useSide)
-    local matches = {}
-    local playerSide = nil
-    if useSide and wantAlly ~= nil then
-        local player = FindFirstOf("AppCharacterPlayer")
-        if isLive(player) then
-            playerSide = safe(function() return unwrap(player:GetSide()) end, nil)
-        end
-    end
-    for _, row in ipairs(emitterRows()) do
-        if row.unit == unitId and isLive(row.actor) then
-            local rankOk = true
-            if useRank and rank ~= nil then
-                rankOk = row.rank == rank
-            end
-            local sideOk = true
-            if useSide and wantAlly ~= nil and playerSide ~= nil and row.side ~= nil then
-                local same = tostring(row.side) == tostring(playerSide)
-                sideOk = (same == true) == (wantAlly == true)
-            end
-            if rankOk and sideOk then
-                matches[#matches + 1] = row.actor
-            end
-        end
-    end
-    return matches
-end
-
-local function pickEmitter(matches, groupId)
-    local ready = {}
-    for _, actor in ipairs(matches) do
-        local index = asInt(actor and actor.DropRecordIndex)
-        if isLive(actor) and index and index >= 0 then
-            ready[#ready + 1] = actor
-        end
-    end
-    matches = ready
-    if #matches == 1 then
-        return matches[1]
-    end
-    if #matches == 0 then
-        return nil
-    end
-    if groupId ~= nil and groupId >= 0 then
-        local found = nil
-        local count = 0
-        for _, actor in ipairs(matches) do
-            if asInt(actor.DropRecordIndex) == groupId then
-                found = actor
-                count = count + 1
-            end
-        end
-        if count == 1 then
-            return found
-        end
-    end
-    local label = nil
-    local same = true
-    for _, actor in ipairs(matches) do
-        local index = asInt(actor.DropRecordIndex)
-        local this = ""
-        if index and dropCache and dropCache.items[index] ~= nil then
-            this = itemLabel(dropCache.items[index]) or ""
-        end
-        if label == nil then
-            label = this
-        elseif this ~= label then
-            same = false
-            break
-        end
-    end
-    if same then
-        return matches[1]
-    end
-    return nil
-end
-
-local uiLib = nil
-local unitNames = {}
-local nameSampleLogged = false
-
-local function cleanName(text)
-    if type(text) ~= "string" then
-        return ""
-    end
-    return (text:match("^%s*(.-)%s*$")) or ""
-end
-
-local function textValue(value)
-    if type(value) == "string" then
-        return value
-    end
-    if value == nil then
-        return nil
-    end
-    local asString = safe(function()
-        if value.ToString then
-            return value:ToString()
-        end
-        return nil
-    end, nil)
-    if type(asString) == "string" and asString ~= "" then
-        return asString
-    end
-    local shown = unwrap(value)
-    if type(shown) == "string" and shown ~= "" and shown ~= "nil" then
-        return shown
-    end
-    return nil
-end
-
-local function uiFunction()
-    if isLive(uiLib) then
-        return uiLib
-    end
-    uiLib = StaticFindObject("/Script/Refine.Default__UIFunction")
-    return isLive(uiLib) and uiLib or nil
-end
-
-local function unitDisplayName(unitId, disp)
-    if unitId == nil then
-        return nil
-    end
-    local key = tostring(unitId) .. (disp and ":d" or ":r")
-    local cached = unitNames[key]
-    if cached ~= nil then
-        return cached ~= false and cached or nil
-    end
-    local fn = uiFunction()
-    if not fn then
-        return nil
-    end
-    local text = nil
-    local ok = pcall(function()
-        text = textValue(fn:GetUnitName(unitId, disp and true or false))
-    end)
-    if not ok then
-        unitNames[key] = false
-        return nil
-    end
-    local cleaned = cleanName(text)
-    unitNames[key] = cleaned ~= "" and cleaned or false
-    return unitNames[key] ~= false and unitNames[key] or nil
-end
-
-local function sameCardName(unitId, card, useDisp)
-    if card == "" or unitId == nil then
-        return false
-    end
-    local raw = unitDisplayName(unitId, false)
-    if raw and raw:lower() == card:lower() then
-        return true
-    end
-    if not useDisp then
-        return false
-    end
-    local disp = unitDisplayName(unitId, true)
-    return disp ~= nil and disp:lower() == card:lower()
-end
-
-local function readEntries(array)
-    local rows = {}
-    if array == nil then
-        return rows
-    end
-    local function take(info)
-        local inner = info
-        if info and info.get then
-            local got = safe(function() return info:get() end, nil)
-            if got ~= nil then
-                inner = got
-            end
-        end
-        local unit = fieldInt(inner, "UnitID")
-        if unit and unit ~= 0 then
-            rows[#rows + 1] = {
-                unit = unit,
-                group = fieldInt(inner, "GroupID"),
-                rank = fieldInt(inner, "Rank"),
-            }
-        end
-    end
-    local walked = false
-    local ok = pcall(function()
-        array:ForEach(function(info)
-            walked = true
-            take(info)
-        end)
-    end)
-    if ok and walked then
-        return rows
-    end
-    local count = tonumber(safe(function() return array:GetArrayNum() end, 0)) or 0
-    for index = 0, count - 1 do
-        take(safe(function() return array:Get(index) end, nil))
-    end
-    return rows
-end
-
-local function emittersNamed(card, wantAlly, useDisp)
-    local matches = {}
-    local function gather(useSide)
-        local found = {}
-        local playerSide = nil
-        if useSide and wantAlly ~= nil then
-            local player = FindFirstOf("AppCharacterPlayer")
-            if isLive(player) then
-                playerSide = safe(function() return unwrap(player:GetSide()) end, nil)
-            end
-        end
-        for _, row in ipairs(emitterRows()) do
-            if isLive(row.actor) and sameCardName(row.unit, card, useDisp) then
-                local keep = true
-                if useSide and wantAlly ~= nil and playerSide ~= nil and row.side ~= nil then
-                    local same = tostring(row.side) == tostring(playerSide)
-                    keep = (same == true) == (wantAlly == true)
-                end
-                if keep then
-                    found[#found + 1] = row.actor
-                end
-            end
-        end
-        return found
-    end
-    matches = gather(true)
-    if #matches == 0 then
-        matches = gather(false)
-    end
-    return matches
-end
-
-local function listEntryForName(list, card, ally, useDisp)
-    local arrays = {}
-    if ally ~= false and list then
-        arrays[#arrays + 1] = safe(function() return list.UnitInfoList end, nil)
-    end
-    if ally ~= true and list then
-        arrays[#arrays + 1] = safe(function() return list.EnemyUnitInfoList end, nil)
-    end
-    local hits = {}
-    for _, array in ipairs(arrays) do
-        for _, entry in ipairs(readEntries(array)) do
-            if sameCardName(entry.unit, card, useDisp) then
-                hits[#hits + 1] = entry
-            end
-        end
-    end
-    if #hits == 1 then
-        return hits[1]
-    end
-    return nil
-end
-
-local function labelFromActor(actor, count, how)
-    local index = asInt(actor and actor.DropRecordIndex)
-    if not index or index < 0 or not dropCache then
-        return nil, how .. " index=" .. tostring(index)
-    end
-    local raw = dropCache.items[index]
-    local why = string.format("%s index=%s n=%d", how, tostring(index), count)
-    if lowByte(raw) == 255 then
-        why = why .. " blank"
-    end
-    return itemLabel(raw), why
-end
-
-local ambiguousLogged = {}
-
-local function logAmbiguous(card, matches, rowGroup, focusGroup)
-    local key = tostring(card) .. ":" .. tostring(rowGroup) .. ":" .. tostring(focusGroup)
-    if ambiguousLogged[key] then
-        return
-    end
-    ambiguousLogged[key] = true
-    local bits = {}
-    for _, actor in ipairs(matches) do
-        local unit = callInt(actor, "GetUnitTypeInt")
-        bits[#bits + 1] = string.format(
-            "type=%s rank=%s index=%s raw=[%s] disp=[%s]",
-            tostring(unit),
-            tostring(callInt(actor, "GetUnitRankNum")),
-            tostring(asInt(actor.DropRecordIndex)),
-            tostring(unitDisplayName(unit, false)),
-            tostring(unitDisplayName(unit, true))
-        )
-    end
-    log(string.format(
-        "info ambiguous [%s] row=%s focus=%s %s",
-        card,
-        tostring(rowGroup),
-        tostring(focusGroup),
-        table.concat(bits, " | ")
-    ))
-end
-
--- List rows keep AlgoGroupID in GroupID. GetGroupNowPos indexes the
--- battle-record array by that id, so it is the same number as DropRecordIndex.
-local setupScan = { at = -1000, rows = {} }
-
-local function setupRows()
-    local now = os.clock()
-    if setupScan.rows and now - setupScan.at < 1.0 then
-        return setupScan.rows
-    end
-    local rows = {}
-    for _, className in ipairs({
-        "BP_parts_battle_setup_chara_list_C",
-        "BP_parts_battle_setup_chara_sub_C",
-    }) do
-        for _, row in ipairs(FindAllOf(className) or {}) do
-            local full = safe(function() return row:GetFullName() end, "") or ""
-            if isLive(row) and not full:find("Default__", 1, true) then
-                rows[#rows + 1] = row
-            end
-        end
-    end
-    setupScan.at = now
-    setupScan.rows = rows
-    return rows
-end
-
-local function oneGroup(ids)
-    local seen = {}
-    local only = nil
-    local count = 0
-    for _, group in ipairs(ids) do
-        if not seen[group] then
-            seen[group] = true
-            only = group
-            count = count + 1
-        end
-    end
-    if count == 1 then
-        return only
-    end
-    return nil
-end
-
-local function focusedListGroup(card)
-    local want = cleanName(card):lower()
-    if want == "" or want:find("<", 1, true) then
-        return nil
-    end
-    local function fromMarker(useLine)
-        local hits = {}
-        for _, row in ipairs(setupRows()) do
-            if isLive(row) and widgetShown(row) then
-                local marker = safe(function()
-                    if useLine then
-                        return row.focus_line
-                    end
-                    return row.text_chara_focus
-                end, nil)
-                if isLive(marker) and widgetShown(marker) then
-                    local shown = cleanName(textOf(row.text_chara_focus))
-                    if shown == "" or shown:find("<", 1, true) then
-                        shown = cleanName(textOf(row.text_chara))
-                    end
-                    if shown:lower() == want then
-                        local group = fieldInt(row, "GroupID")
-                        if group ~= nil and group >= 0 then
-                            hits[#hits + 1] = group
-                        end
-                    end
-                end
-            end
-        end
-        return oneGroup(hits)
-    end
-    local group = fromMarker(false)
-    if group ~= nil then
-        return group
-    end
-    return fromMarker(true)
-end
-
--- Exactly one emitter whose record index is this group. Several matches,
--- or none, stay unresolved so another officer's drop is not borrowed.
-local function emitterByGroup(matches, groupId)
-    if groupId == nil or groupId < 0 then
-        return nil
-    end
-    local found = nil
-    local count = 0
-    for _, actor in ipairs(matches) do
-        local index = asInt(actor and actor.DropRecordIndex)
-        if isLive(actor) and index ~= nil and index >= 0 and index == groupId then
-            found = actor
-            count = count + 1
-        end
-    end
-    if count == 1 then
-        return found
-    end
-    return nil
-end
-
--- NowFocusGroupID for these officers is 1, 2, 3, 4 while their record
--- indexes are 16, 17, 18, 19. The focus value is the row in the pause list.
-local function listEntries(list, ally)
-    local arrays = {}
-    if ally ~= false and list then
-        arrays[#arrays + 1] = safe(function() return list.UnitInfoList end, nil)
-    end
-    if ally ~= true and list then
-        arrays[#arrays + 1] = safe(function() return list.EnemyUnitInfoList end, nil)
-    end
-    local rows = {}
-    for _, array in ipairs(arrays) do
-        for _, entry in ipairs(readEntries(array)) do
-            rows[#rows + 1] = entry
-        end
-    end
-    return rows
-end
-
-local function ordinalAt(entries, card, useDisp, luaIndex)
-    local entry = entries[luaIndex]
-    if not entry or not sameCardName(entry.unit, card, useDisp) then
-        return nil
-    end
-    local count = 0
-    for index = 1, luaIndex do
-        if sameCardName(entries[index].unit, card, useDisp) then
-            count = count + 1
-        end
-    end
-    if count >= 1 then
-        return count
-    end
-    return nil
-end
-
-local function emitterByOrder(matches, ordinal)
-    if ordinal == nil or ordinal < 1 then
-        return nil
-    end
-    local ready = {}
-    for _, actor in ipairs(matches) do
-        local index = asInt(actor and actor.DropRecordIndex)
-        if isLive(actor) and index ~= nil and index >= 0 then
-            ready[#ready + 1] = actor
-        end
-    end
-    table.sort(ready, function(a, b)
-        return asInt(a.DropRecordIndex) < asInt(b.DropRecordIndex)
-    end)
-    return ready[ordinal]
-end
-
-local orderLogged = {}
-local listLogged = {}
-
-local function logList(card, entries, focusGroup)
-    if listLogged[card] then
-        return
-    end
-    listLogged[card] = true
-    local bits = {}
-    for index = 1, math.min(#entries, 8) do
-        local entry = entries[index]
-        bits[#bits + 1] = string.format(
-            "%d:type=%s group=%s",
-            index,
-            tostring(entry.unit),
-            tostring(entry.group)
-        )
-    end
-    log(string.format(
-        "info list [%s] focus=%s n=%d %s",
-        card,
-        tostring(focusGroup),
-        #entries,
-        table.concat(bits, " | ")
-    ))
-end
-
-local function logOrder(card, focusGroup, ordinal, actor)
-    local key = tostring(card) .. ":" .. tostring(focusGroup)
-    if orderLogged[key] then
-        return
-    end
-    orderLogged[key] = true
-    log(string.format(
-        "info order [%s] focus=%s ordinal=%s index=%s",
-        card,
-        tostring(focusGroup),
-        tostring(ordinal),
-        tostring(asInt(actor and actor.DropRecordIndex))
-    ))
-end
-
--- FocusUnit comes through as unit 0, group -1. The name painted on the card
--- is the officer. The raw unit name is tried first, so a subordinate whose
--- display name copies the officer does not compete with him. Officers who
--- share that name are separated by the highlighted list row.
-local function resolveInfoLabel(list, focus, cardName)
-    if not dropCache then
-        return nil, "pending"
-    end
-    local card = cleanName(cardName)
-    local ally = focus and focus.ally or nil
-    if card ~= "" and not card:find("<", 1, true) then
-        local useDisp = false
-        local named = emittersNamed(card, ally, false)
-        local entry = listEntryForName(list, card, ally, false)
-        if #named == 0 then
-            useDisp = true
-            named = emittersNamed(card, ally, true)
-            entry = listEntryForName(list, card, ally, true)
-        end
-        local actor = nil
-        if #named > 1 then
-            actor = emitterByGroup(named, focus and focus.rowGroup)
-                or emitterByGroup(named, focus and focus.group)
-                or emitterByGroup(named, entry and entry.group)
-            if not isLive(actor) then
-                local entries = listEntries(list, ally)
-                local focusGroup = focus and focus.group or nil
-                local ordinal = nil
-                if focusGroup ~= nil and focusGroup >= 1 then
-                    ordinal = ordinalAt(entries, card, useDisp, focusGroup)
-                    if ordinal == nil then
-                        ordinal = ordinalAt(entries, card, useDisp, focusGroup + 1)
-                    end
-                    if ordinal == nil and #entries == 0 and focusGroup <= #named then
-                        ordinal = focusGroup
-                    end
-                end
-                actor = emitterByOrder(named, ordinal)
-                if isLive(actor) then
-                    logOrder(card, focusGroup, ordinal, actor)
-                else
-                    logList(card, entries, focusGroup)
-                end
-            end
-        end
-        if not isLive(actor) then
-            actor = pickEmitter(named, entry and entry.group or (focus and focus.group))
-        end
-        if not isLive(actor) and entry and entry.unit and entry.unit ~= 0 then
-            local passes = {
-                { true, true },
-                { false, true },
-                { false, false },
-            }
-            for _, pass in ipairs(passes) do
-                local matches = collectEmitters(entry.unit, entry.rank, ally, pass[1], pass[2])
-                if #matches > 0 then
-                    actor = pickEmitter(matches, entry.group)
-                    if isLive(actor) then
-                        named = matches
-                        break
-                    end
-                    logAmbiguous(card, matches, focus and focus.rowGroup, focus and focus.group)
-                    return nil, "ambiguous " .. tostring(#matches)
-                end
-            end
-        end
-        if isLive(actor) then
-            return labelFromActor(actor, #named, "name")
-        end
-        if #named > 1 then
-            logAmbiguous(card, named, focus and focus.rowGroup, focus and focus.group)
-            return nil, "ambiguous " .. tostring(#named)
-        end
-        if not nameSampleLogged then
-            nameSampleLogged = true
-            local sample = emitterRows()[1]
-            local sampleName = sample and unitDisplayName(sample.unit, false) or nil
-            log(string.format(
-                "info name miss [%s] sample type=%s name=[%s]",
-                card,
-                tostring(sample and sample.unit),
-                tostring(sampleName)
-            ))
-        end
-    end
-    if not focus or focus.unit == nil or focus.unit == 0 then
-        return nil, "no-unit"
-    end
-    local passes = {
-        { true, true },
-        { true, false },
-        { false, true },
-        { false, false },
-    }
-    for _, pass in ipairs(passes) do
-        local matches = collectEmitters(focus.unit, focus.rank, focus.ally, pass[1], pass[2])
-        if #matches > 0 then
-            local actor = pickEmitter(matches, focus.group)
-            if not isLive(actor) then
-                return nil, "ambiguous " .. tostring(#matches)
-            end
-            return labelFromActor(actor, #matches, "focus")
-        end
-    end
-    return nil, "none"
-end
-
-local function cacheStamp()
-    if not dropCache then
-        return "pending"
-    end
-    return numText(dropCache.data) .. ":" .. tostring(dropCache.count)
-end
-
-local function answerFor(list, focus, name)
-    local key = widgetKey(list)
-    local slot = infoAnswers[key]
-    if not slot then
-        slot = {}
-        infoAnswers[key] = slot
-    end
-    local card = textOf(name)
-    local token = table.concat({
-        card,
-        tostring(focus.ally),
-        tostring(focus.group),
-        cacheStamp(),
-    }, ":")
-    local retry = slot.label == nil and not (slot.why and slot.why:find("blank", 1, true))
-        and os.clock() - (slot.at or 0) > 1.0
-    if slot.token ~= token or retry then
-        slot.token = token
-        slot.at = os.clock()
-        slot.label, slot.why = resolveInfoLabel(list, focus, card)
-        local why = slot.why or ""
-        local failed = slot.label == nil
-            and why ~= "pending"
-            and why ~= "no-unit"
-            and not why:find("blank", 1, true)
-            and not why:find("ambiguous", 1, true)
-        if failed and slot.line ~= why and infoLogs < 8 then
-            slot.line = why
-            infoLogs = infoLogs + 1
-            log(string.format(
-                "info [%s] unit=%s rank=%s group=%s ally=%s %s",
-                card,
-                tostring(focus.unit),
-                tostring(focus.rank),
-                tostring(focus.group),
-                tostring(focus.ally),
-                why
-            ))
-        end
-    end
-    return slot.label
-end
-
-local function eachDescendant(root, fn)
-    local seen = {}
-    local function walk(widget, depth)
-        local current = asWidget(widget)
-        if not current or depth > 16 then
-            return
-        end
-        local id = widgetKey(current)
-        if seen[id] then
-            return
-        end
-        seen[id] = true
-        fn(current)
-        local count = tonumber(safe(function() return current:GetChildrenCount() end, 0)) or 0
-        for index = 0, count - 1 do
-            walk(safe(function() return current:GetChildAt(index) end, nil), depth + 1)
-        end
-    end
-    walk(root, 0)
-end
-
-local function protectedCardText(detail, widget)
-    if not isLive(detail) or not isLive(widget) then
-        return false
-    end
-    return sameObject(widget, detail.UnitName)
-        or sameObject(widget, detail.unitname_ruby)
-        or sameObject(widget, detail.index_morale)
-        or sameObject(widget, detail.index_morale_2)
-        or sameObject(widget, detail.index_busho)
-end
-
-local function claimInfo(widget)
-    if isLive(widget) then
-        infoOwned[widgetKey(widget)] = true
-    end
-end
-
-local function infoEntry(detail)
-    local key = widgetKey(detail)
-    local entry = infoEntries[key]
-    if not entry then
-        entry = { fontReady = false, reveals = 0 }
-        infoEntries[key] = entry
-    end
-    return entry
-end
-
-local function placeInfoText(entry, widget, detail)
-    local face = isLive(detail) and detail.face_000 or nil
-    if not isLive(face) then
-        if not infoMissLogged then
-            infoMissLogged = true
-            log("info portrait missing")
-        end
-        return false
-    end
-    entry.marker = face
-    if attachPortrait(widget, face, true, 10) then
-        return true
-    end
-    return false
-end
-
-local function styleInfoNote(name, widget, entry)
-    if entry.fontReady or not isLive(name) or not isLive(widget) then
-        return
-    end
-    local font = safe(function() return name.Font end, nil)
-    local size = font and tonumber(font.Size) or nil
-    if not size or size <= 8 then
-        return
-    end
-    local fontOk = pcall(function()
-        font.Size = math.floor(size * 0.65)
-        widget:SetFont(font)
-    end)
-    font.Size = size
-    pcall(function() name:SetFont(font) end)
-    pcall(function() widget:SetColorAndOpacity(name.ColorAndOpacity) end)
-    if fontOk then
-        entry.fontReady = true
-    elseif not infoFontLogged then
-        infoFontLogged = true
-        log("info font failed")
-    end
-end
-
-local function findInfoMarker(detail)
-    local found = nil
-    local extras = {}
-    local function take(widget)
-        if not isInfoMarker(widget) or protectedCardText(detail, widget) then
-            return
-        end
-        if not widgetClass(widget):find("TextBlock", 1, true) then
-            return
-        end
-        if not found then
-            found = widget
-        elseif not sameObject(widget, found) then
-            extras[#extras + 1] = widget
-        end
-    end
-    local root = safe(function() return detail.WidgetTree.RootWidget end, nil)
-    eachDescendant(root, take)
-    for _, extra in ipairs(extras) do
-        pcall(function() extra:SetVisibility(1) end)
-        local parent = parentOf(extra)
-        if isLive(parent) then
-            pcall(function() parent:RemoveChild(extra) end)
-        end
-    end
-    return found
-end
-
-local function makeInfoNote(detail)
-    local class = StaticFindObject("/Script/UMG.TextBlock")
-    if not isLive(class) then
-        return nil
-    end
-    local widget = nil
-    local named = pcall(function()
-        widget = StaticConstructObject(class, detail, FName("DropViewerInfo"))
-    end)
-    if not named or not isLive(widget) then
-        widget = safe(function() return StaticConstructObject(class, detail) end, nil)
-    end
-    if isLive(widget) and not isInfoMarker(widget) then
-        pcall(function() widget:Rename(FName("DropViewerInfo"), detail) end)
-    end
-    if isLive(widget) and not isInfoMarker(widget) and not infoMissLogged then
-        infoMissLogged = true
-        log("info name " .. widgetClass(widget))
-    end
-    return widget
-end
-
-local function revealInfo(widget)
-    pcall(function()
-        widget:InvalidateLayoutAndVolatility()
-        widget:ForceVolatile(true)
-    end)
-    local current = widget
-    for _ = 1, 8 do
-        local parent = parentOf(current)
-        if not isLive(parent) then
-            break
-        end
-        if widgetClass(parent):find("InvalidationBox", 1, true) then
-            pcall(function() parent:InvalidateCache() end)
-            break
-        end
-        current = parent
-    end
-end
-
-local function ensureInfoNote(detail, name)
-    local entry = infoEntry(detail)
-    if not (isLive(entry.widget) and isLive(parentOf(entry.widget))) then
-        local existing = findInfoMarker(detail)
-        if isLive(existing) then
-            entry.widget = existing
-            entry.fontReady = false
-        elseif not isLive(entry.widget) then
-            entry.widget = makeInfoNote(detail)
-            entry.fontReady = false
-        end
-        if isLive(entry.widget) then
-            claimInfo(entry.widget)
-            placeInfoText(entry, entry.widget, detail)
-        end
-    end
-    if not isLive(entry.widget) then
-        return nil, entry
-    end
-    claimInfo(entry.widget)
-    styleInfoNote(name, entry.widget, entry)
-    if isLive(entry.marker) then
-        attachPortrait(entry.widget, entry.marker, true, 10)
-    end
-    return entry.widget, entry
-end
-
-local function showInfoNote(note, entry, label, name)
-    if not isLive(note) then
-        return
-    end
-    local nameText = textOf(name)
-    local nextText = label or ""
-    local key = nameText .. "|" .. nextText
-    if isLive(entry.marker) then
-        attachPortrait(note, entry.marker, true, 10)
-    end
-    if textOf(note) ~= nextText then
-        setWidgetText(note, nextText)
-    end
-    if label then
-        pcall(function()
-            note:SetVisibility(4)
-            note:SetRenderOpacity(1)
-        end)
-    else
-        pcall(function() note:SetVisibility(1) end)
-    end
-    if entry.key ~= key then
-        entry.key = key
-        if (entry.reveals or 0) < 3 then
-            entry.reveals = 3
-        end
-    end
-    if (entry.reveals or 0) > 0 then
-        revealInfo(note)
-        entry.reveals = entry.reveals - 1
-    end
-end
-
-local function refreshInfoList(list)
-    if not isLive(list) then
-        return
-    end
-    local full = safe(function() return list:GetFullName() end, "") or ""
-    if full:find("Default__", 1, true) or not branchShown(list) then
-        return
-    end
-    local detail = asWidget(safe(function() return list.BP_parts_battle_setup_chara_detail end, nil))
-    if not isLive(detail) then
-        return
-    end
-    local name = asWidget(safe(function() return detail.UnitName end, nil))
-    if not isLive(name) then
-        return
-    end
-    local focus = readFocus(list)
-    local label = nil
-    if focus then
-        label = answerFor(list, focus, name)
-    end
-    local note, entry = ensureInfoNote(detail, name)
-    showInfoNote(note, entry, label, name)
-end
-
-local infoLists = nil
-local infoListsAt = -1000
-
-local function refreshInfo()
-    local now = os.clock()
-    local stale = not infoLists or now - infoListsAt > 2.0
-    if not stale then
-        for _, list in ipairs(infoLists) do
-            if not isLive(list) then
-                stale = true
-                break
-            end
-        end
-    end
-    if stale then
-        infoLists = {}
-        local all = FindAllOf("BP_battle_setup_info_unit_C") or {}
-        for _, list in ipairs(all) do
-            local full = safe(function() return list:GetFullName() end, "") or ""
-            if isLive(list) and not full:find("Default__", 1, true) then
-                infoLists[#infoLists + 1] = list
-            end
-        end
-        infoListsAt = now
-    end
-    for _, list in ipairs(infoLists) do
-        local ok, err = pcall(refreshInfoList, list)
-        if not ok and not infoFailed then
-            infoFailed = true
-            log("info " .. tostring(err))
-        end
-    end
-end
-
 local paneFailed = false
 local hooksReady = {}
 
@@ -2296,25 +1188,6 @@ local function ensureHooks()
             log("gauge tick hook " .. tostring(err))
         end
     end
-    if not hooksReady.info then
-        local ok, err = pcall(function()
-            RegisterHook("/Game/UI/03_battle_setup/BP_battle_setup_info_unit.BP_battle_setup_info_unit_C:Tick", function()
-            end, function(self)
-                local list = safe(function() return self:get() end, nil)
-                local hooked, hookErr = pcall(refreshInfoList, list)
-                if not hooked and not infoFailed then
-                    infoFailed = true
-                    log("info " .. tostring(hookErr))
-                end
-            end)
-        end)
-        if ok then
-            hooksReady.info = true
-        elseif not hooksReady.infoLogged and isLive(FindFirstOf("BP_battle_setup_info_unit_C")) then
-            hooksReady.infoLogged = true
-            log("info tick hook " .. tostring(err))
-        end
-    end
 end
 
 local restorePasses = 0
@@ -2327,7 +1200,6 @@ local function refreshPane()
         restorePasses = restorePasses + 1
     end
     refreshLabel()
-    refreshInfo()
     ensureHooks()
 end
 

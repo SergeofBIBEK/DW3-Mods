@@ -2,7 +2,7 @@
 
 Shows an officer's assigned drop in Dynasty Warriors 3: Xtreme Legends Complete Edition Remastered.
 
-Lock on to an officer during battle. The drop name appears under the portrait, in smaller text. When a combo can raise that drop, a gold `8+`, `16+`, or `24+` sits on the next line. Open the pause Unit Info card and the same drop name appears above the portrait.
+Lock on to an officer during battle. The drop name appears under the portrait, in smaller text. When a combo can raise that drop, a gold `8+`, `16+`, or `24+` sits on the next line.
 
 ## Requirements
 
