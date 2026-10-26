@@ -1,0 +1,5 @@
+LIBRARY read_i32.dll
+
+EXPORTS
+UnitDropsPrepare
+UnitDropsStart
