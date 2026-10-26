@@ -1,7 +1,7 @@
 -- Mount UI
 -- Personal HUD edits for the mounted dash icons.
--- Hides the mounted button guide while the dash gauge is showing.
--- On-foot guides stay with the game.
+-- The mounted button guide stays hidden. Nothing in this script shows it again.
+-- The mash prompt is a different widget and is left alone.
 -- Moves the dash icons under the Musou bar, beside the horse icon.
 -- Compact layout: X 496, bottom margin 0, spacing 60 (native 108).
 -- Icon size stays the same. Two local players add X -90 and Y +17.
@@ -17,7 +17,6 @@ local ICON_HEIGHT = 108.0
 local SPLIT_X = -90.0
 local SPLIT_Y = 17.0
 local PAD = (SPACING - NATIVE_SPACING) * 0.5
-local COLLAPSED = 1
 local PLAYER_CACHE_SEC = 0.25
 
 local function log(msg)
@@ -64,37 +63,6 @@ local function asInt(value)
         return tostring(value)
     end, "") or ""
     return tonumber(text:match("-?%d+"))
-end
-
-local function asBool(value)
-    if value == true then
-        return true
-    end
-    if value == false or value == nil then
-        return false
-    end
-    if type(value) == "number" then
-        return value ~= 0
-    end
-    local inner = safe(function()
-        if value.get then
-            return value:get()
-        end
-        return nil
-    end, nil)
-    if inner == true then
-        return true
-    end
-    if type(inner) == "number" then
-        return inner ~= 0
-    end
-    local text = safe(function()
-        if value.ToString then
-            return value:ToString()
-        end
-        return tostring(value)
-    end, "") or ""
-    return text == "true" or text == "1"
 end
 
 local function asWidget(value)
@@ -303,7 +271,6 @@ end
 local playerCache = {}
 local playerCacheAt = -1
 local splitOn = false
-local dashUsesRiding = false
 
 local function refreshPlayers()
     local now = os.clock()
@@ -338,50 +305,6 @@ local function refreshPlayers()
     splitOn = isLive(playerCache[0]) and isLive(playerCache[1])
 end
 
-local function dashShowing(actor)
-    if not isLive(actor) then
-        return false
-    end
-    local ok, value = pcall(function()
-        return actor:IsDispHorseDashGauge()
-    end)
-    if ok then
-        return asBool(value)
-    end
-    if not dashUsesRiding then
-        dashUsesRiding = true
-        log("dash gauge check failed, using riding")
-    end
-    local rideOk, riding = pcall(function()
-        return actor:IsRiding()
-    end)
-    return rideOk and asBool(riding)
-end
-
--- The dash-gauge flag can blip off while the horse prompt fade is still playing.
--- Stay hidden for the whole time the player is on a horse.
-local function horseMounted(actor)
-    if dashShowing(actor) then
-        return true
-    end
-    if not isLive(actor) then
-        return false
-    end
-    local ok, value = pcall(function()
-        return actor:IsRidingHorse()
-    end)
-    return ok and asBool(value)
-end
-
-local function guideShouldHide(host)
-    refreshPlayers()
-    local splitHost = isLive(safe(function() return host.bp_parts_gauge_pc_multi end, nil))
-    if splitHost then
-        return horseMounted(playerCache[0]) or horseMounted(playerCache[1])
-    end
-    return horseMounted(playerCache[0])
-end
-
 local loggedLayout = false
 local loggedHide = false
 local loggedSlot = false
@@ -389,36 +312,16 @@ local loggedPad = false
 local loggedBox = false
 local loggedEmpty = false
 
--- Collapsing the guide makes the game play ANM_guide_in again, so the
--- prompt fades back in. Leave visibility alone, stop that fade, and
--- keep the widget transparent until the player is off the horse.
-local forcedGuides = {}
-
-local function guideKey(guide)
-    return safe(function() return tostring(guide:GetAddress()) end, nil)
-end
-
+-- The game fades this widget in when you mount. Collapsing it makes that
+-- fade start over. Stop the fade and leave the widget at zero size.
 local function forceHide(guide)
     if not isLive(guide) then
         return false
     end
-    local ok = pcall(function()
+    return pcall(function()
         guide:StopAllAnimations()
         guide:SetRenderOpacity(0)
-    end)
-    local key = guideKey(guide)
-    if key then
-        forcedGuides[key] = guide
-    end
-    return ok
-end
-
-local function releaseGuide(guide)
-    if not isLive(guide) then
-        return
-    end
-    pcall(function()
-        guide:SetRenderOpacity(1)
+        guide:SetRenderScale({ X = 0.0, Y = 0.0 })
     end)
 end
 
@@ -427,20 +330,12 @@ local function syncGuide(host)
     if not isLive(guide) then
         return false
     end
-    if guideShouldHide(host) then
-        local ok = forceHide(guide)
-        if ok and not loggedHide then
-            loggedHide = true
-            log("mounted guide hidden")
-        end
-        return ok
+    local ok = forceHide(guide)
+    if ok and not loggedHide then
+        loggedHide = true
+        log("interact guide hidden")
     end
-    local key = guideKey(guide)
-    if key and forcedGuides[key] then
-        releaseGuide(guide)
-        forcedGuides[key] = nil
-    end
-    return false
+    return ok
 end
 
 local function layoutBoost(host)
@@ -670,17 +565,7 @@ local function onGuideFadeIn(self)
     if not isLive(guide) or isDefault(guide) then
         return
     end
-    local host = hostOf(guide)
-    if isLive(host) then
-        if guideShouldHide(host) then
-            forceHide(guide)
-        end
-        return
-    end
-    refreshPlayers()
-    if horseMounted(playerCache[0]) or horseMounted(playerCache[1]) then
-        forceHide(guide)
-    end
+    forceHide(guide)
 end
 
 local function tryRegisterFade()
