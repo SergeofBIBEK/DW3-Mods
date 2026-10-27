@@ -4,9 +4,11 @@
 -- The mash prompt is a different widget and is left alone.
 -- Moves the dash icons under the Musou bar, beside the horse icon.
 -- Compact layout: X 496, bottom margin 0, spacing 60 (native 108).
--- Icon size stays the same. Two local players add X -90 and Y +17.
--- Positive Y in that pair is up. Canvas Y grows downward, so the slot
--- top is the negation of the margin.
+-- Solo row height stays 108. Two local players add X -90.
+-- Their icons are shorter than that row and sit on its bottom edge.
+-- The split row uses the icon height, and that edge moves up by the
+-- leftover height. Until the horse icon can be measured, the row starts
+-- 17 higher than solo.
 
 local MOD = "Mount UI"
 local POSITION_X = 496.0
@@ -209,6 +211,109 @@ local function applyPad(slot)
     end)
 end
 
+local slate = nil
+
+local function slateLib()
+    if isLive(slate) then
+        return slate
+    end
+    slate = StaticFindObject("/Script/UMG.Default__SlateBlueprintLibrary")
+    if not isLive(slate) then
+        slate = StaticFindObject("/Script/UMG.SlateBlueprintLibrary")
+    end
+    return slate
+end
+
+local function vec2(value)
+    if type(value) ~= "userdata" and type(value) ~= "table" then
+        return nil, nil
+    end
+    local x = tonumber(value.X) or tonumber(value.x)
+    local y = tonumber(value.Y) or tonumber(value.y)
+    if x and y then
+        return x, y
+    end
+    return nil, nil
+end
+
+-- Bottom of the horse icon, and the canvas height, in that canvas's space.
+-- A bottom-anchored slot uses y = bottom - height, which is negative when
+-- the icon sits above the canvas bottom.
+local function horseBottom(canvas, horse)
+    local lib = slateLib()
+    if not isLive(lib) or not isLive(canvas) or not isLive(horse) then
+        return nil, nil
+    end
+    local okHorse, horseGeo = pcall(function() return horse:GetCachedGeometry() end)
+    local okCanvas, canvasGeo = pcall(function() return canvas:GetCachedGeometry() end)
+    if not okHorse or not okCanvas or horseGeo == nil or canvasGeo == nil then
+        return nil, nil
+    end
+    local okHorseSize, horseSize = pcall(function() return lib:GetLocalSize(horseGeo) end)
+    local okCanvasSize, canvasSize = pcall(function() return lib:GetLocalSize(canvasGeo) end)
+    if not okHorseSize or not okCanvasSize then
+        return nil, nil
+    end
+    local horseW, horseH = vec2(horseSize)
+    local _, canvasH = vec2(canvasSize)
+    if not horseW or horseW < 2 or not horseH or horseH < 2 or not canvasH or canvasH < 2 then
+        return nil, nil
+    end
+    local okFar, far = pcall(function()
+        return lib:LocalToAbsolute(horseGeo, { X = 0.0, Y = horseH })
+    end)
+    if not okFar or far == nil then
+        return nil, nil
+    end
+    local okLocal, localPos = pcall(function()
+        return lib:AbsoluteToLocal(canvasGeo, far)
+    end)
+    if not okLocal or localPos == nil then
+        return nil, nil
+    end
+    local _, bottom = vec2(localPos)
+    if not bottom then
+        return nil, nil
+    end
+    return bottom, canvasH
+end
+
+-- Slot size, then desired size, then the brush. Values outside a HUD
+-- icon are ignored so a raw texture size does not become the row height.
+local function spanHeight(widget)
+    if not isLive(widget) then
+        return nil
+    end
+    local slot = safe(function() return widget.Slot end, nil)
+    if isLive(slot) then
+        local _, h = vec2(safe(function() return slot:GetSize() end, nil))
+        if h and h >= 8 and h <= 220 then
+            return h
+        end
+    end
+    local _, desired = vec2(safe(function() return widget:GetDesiredSize() end, nil))
+    if desired and desired >= 8 and desired <= 220 then
+        return desired
+    end
+    local _, brush = vec2(safe(function() return widget.Brush.ImageSize end, nil))
+    if brush and brush >= 8 and brush <= 220 then
+        return brush
+    end
+    return nil
+end
+
+local function visualScale(widget)
+    local transform = safe(function() return widget:GetRenderTransform() end, nil)
+    if type(transform) ~= "userdata" and type(transform) ~= "table" then
+        return nil
+    end
+    local _, y = vec2(transform.Scale)
+    if y and y > 0.2 and y < 0.98 then
+        return y
+    end
+    return nil
+end
+
 local function applyCanvas(slot, anchorX, anchorY, alignX, alignY, x, y, w, h)
     if not isCanvasSlot(slot) then
         return false, "type"
@@ -306,6 +411,13 @@ local function refreshPlayers()
 end
 
 local loggedLayout = false
+local loggedHorse = false
+local loggedSize = false
+local loggedH = nil
+local sizeKnown = false
+-- Both halves share this once either horse icon has a real height.
+-- A later pass with no icon must not put that half back at 108.
+local sharedIconH = nil
 local loggedHide = false
 local loggedSlot = false
 local loggedPad = false
@@ -386,18 +498,109 @@ local function layoutBoost(host)
     if splitOn then
         splitX = SPLIT_X
         splitY = SPLIT_Y
+        -- The spur widget itself has no horse icon. Walking its parents
+        -- during stage load crashed, and writing the tall row from here
+        -- put the split placement back. Leave the slot alone.
+        local pc = asWidget(safe(function() return host.bp_parts_gauge_pc_multi end, nil))
+        if not isLive(pc) then
+            pc = asWidget(safe(function() return host.bp_parts_gauge_pc end, nil))
+        end
+        if not isLive(pc) and not sharedIconH then
+            return
+        end
     end
     local width = SPACING * count
     local x = POSITION_X + splitX
     local y = -(BOTTOM_MARGIN + splitY)
+    local horseAligned = false
+    if splitOn then
+        local gauge = asWidget(safe(function() return host.bp_parts_gauge_pc_multi end, nil))
+        if not isLive(gauge) then
+            gauge = asWidget(safe(function() return host.bp_parts_gauge_pc end, nil))
+        end
+        local horse = isLive(gauge) and asWidget(safe(function() return gauge.icon_horse_call end, nil)) or nil
+        local canvas = asWidget(safe(function() return boost.Slot.Parent end, nil))
+        local bottom, canvasH = horseBottom(canvas, horse)
+        if bottom and canvasH then
+            local aligned = bottom - canvasH
+            if aligned > -400 and aligned < 80 then
+                y = aligned
+                horseAligned = true
+                if not loggedHorse then
+                    loggedHorse = true
+                    loggedLayout = false
+                end
+            end
+        end
+    end
+    local rowH = ICON_HEIGHT
+    if splitOn then
+        local icon = gauges[1]
+        local image = asWidget(safe(function() return icon.Image_base end, nil))
+        if not isLive(image) then
+            image = asWidget(safe(function() return icon.Image_gauge end, nil))
+        end
+        local imageH = spanHeight(image)
+        local gaugeH = spanHeight(icon)
+        local pc = asWidget(safe(function() return host.bp_parts_gauge_pc_multi end, nil))
+        if not isLive(pc) then
+            pc = asWidget(safe(function() return host.bp_parts_gauge_pc end, nil))
+        end
+        local horseIcon = isLive(pc) and asWidget(safe(function() return pc.icon_horse_call end, nil)) or nil
+        local horseH = spanHeight(horseIcon)
+        local scale = visualScale(icon) or visualScale(boost)
+        local scaleH = scale and (ICON_HEIGHT * scale) or nil
+        local picked = nil
+        local function consider(h)
+            if h and h >= 16 and h < ICON_HEIGHT - 4 and (not picked or h < picked) then
+                picked = h
+            end
+        end
+        consider(imageH)
+        consider(gaugeH)
+        consider(horseH)
+        if not picked then
+            consider(scaleH)
+        end
+        if not picked and sharedIconH then
+            picked = sharedIconH
+        end
+        if picked then
+            sharedIconH = picked
+            rowH = picked
+            -- Bottom anchor keeps a shorter slot on the old edge. The icons
+            -- sit on that edge, so the edge has to move up with them.
+            if not horseAligned then
+                y = y - (ICON_HEIGHT - rowH)
+            end
+            for _, gauge in ipairs(gauges) do
+                local slot = safe(function() return gauge.Slot end, nil)
+                if isLive(slot) then
+                    pcall(function() slot:SetVerticalAlignment(3) end)
+                end
+            end
+        end
+        local measured = imageH or gaugeH or horseH or scale
+        if not loggedSize or (loggedH and math.abs(loggedH - rowH) > 1) or (measured and not sizeKnown) then
+            loggedSize = true
+            sizeKnown = sizeKnown or measured ~= nil
+            loggedH = rowH
+            loggedLayout = false
+            log(string.format(
+                "spur box image %.0f gauge %.0f horse %.0f scale %.2f",
+                imageH or -1, gaugeH or -1, horseH or -1, scale or 0))
+        end
+    end
     local inner = safe(function() return box.Slot end, nil)
     local outer = safe(function() return boost.Slot end, nil)
-    local innerOk, innerWhy = applyCanvas(inner, 0.5, 0.5, 0.5, 0.5, 0.0, 0.0, width, ICON_HEIGHT)
-    local outerOk, outerWhy = applyCanvas(outer, 0.0, 1.0, 0.0, 1.0, x, y, width, ICON_HEIGHT)
+    local innerOk, innerWhy = applyCanvas(inner, 0.5, 0.5, 0.5, 0.5, 0.0, 0.0, width, rowH)
+    local outerOk, outerWhy = applyCanvas(outer, 0.0, 1.0, 0.0, 1.0, x, y, width, rowH)
     if innerOk and outerOk then
         if not loggedLayout then
             loggedLayout = true
-            log(string.format("dash icons x %.0f y %.0f spacing %.0f count %d", x, y, SPACING, count))
+            log(string.format(
+                "dash icons x %.0f y %.0f h %.0f spacing %.0f count %d",
+                x, y, rowH, SPACING, count))
         end
         pcall(function()
             boost:InvalidateLayoutAndVolatility()

@@ -7,7 +7,11 @@
 -- the pickup function reads. The 300 second floor is the game's floor.
 --   AppCharacterPlayer +0xD6C = Perfect count
 --   AppCharacterPlayer +0xD70 = Great count
--- The label sits just above the player portrait, lined up with its left edge.
+-- The label sits just above the player portrait, lined up with its left edge,
+-- then 8 px lower.
+-- A gauge with no portrait uses the officer name instead.
+-- Each local player has their own Perfect and Great counts. The top half
+-- shows player 1. The bottom half shows player 2.
 -- The gauge's outer slot is above the canvas, so that slot is not used.
 
 local MOD = "Combo Efficiency"
@@ -16,7 +20,7 @@ local GREAT_WEIGHT = 5
 local TIME_FLOOR = 300
 local RATE_PLUS_TWO = 0.13
 local RATE_PLUS_ONE = 0.06
-local NUDGE_X = 12
+local NUDGE_Y = 8
 
 local function log(msg)
     print(string.format("[%s] %s", MOD, tostring(msg)))
@@ -83,6 +87,50 @@ local function asInt(value)
     return tonumber(text:match("-?%d+"))
 end
 
+-- PLAYER1 is player id 0. The digit in that name is not the id.
+local function playerId(actor)
+    local value = safe(function() return actor.m_ePlayerID end, nil)
+    if type(value) == "number" then
+        return math.floor(value)
+    end
+    local inner = safe(function()
+        if value and value.get then
+            return value:get()
+        end
+        return nil
+    end, nil)
+    if type(inner) == "number" then
+        return math.floor(inner)
+    end
+    local text = safe(function()
+        if value and value.ToString then
+            return value:ToString()
+        end
+        return tostring(value)
+    end, "") or ""
+    if string.find(text, "PLAYER2", 1, true) then
+        return 1
+    end
+    if string.find(text, "PLAYER1", 1, true) then
+        return 0
+    end
+    if string.match(text, "^%-?%d+$") then
+        return tonumber(text)
+    end
+    return nil
+end
+
+local boards = {}
+
+local function boardFor(id)
+    local board = boards[id]
+    if not board then
+        board = { paintLeft = 0, fontReady = false }
+        boards[id] = board
+    end
+    return board
+end
+
 local function textOf(widget)
     if not isLive(widget) then
         return ""
@@ -120,6 +168,15 @@ local function sameObject(a, b)
         return aa == bb
     end
     return a == b
+end
+
+local function ownedLabel(widget)
+    for _, board in pairs(boards) do
+        if sameObject(widget, board.widget) then
+            return true
+        end
+    end
+    return false
 end
 
 local function widgetClass(widget)
@@ -220,20 +277,13 @@ local function shown(widget)
     return n == 0 or n == 3 or n == 4
 end
 
-local label = nil
-local placedFor = nil
-local fontReady = false
 local readLogged = false
-local seenPerfect = nil
-local seenGreat = nil
-local seenBonus = nil
 local timerState = "pending"
 local scenario = nil
 local playerLogged = false
 local refreshLogged = false
 local placeLogged = false
 local placeFailLogged = false
-local paintLeft = 0
 local geoState = "pending"
 local placeTries = 0
 local swept = false
@@ -360,31 +410,33 @@ local function scenarioSeconds()
     return seconds
 end
 
-local function playerActor()
+local function localPlayers()
+    local byId = {}
+    local loose = nil
     local all = FindAllOf("AppCharacterPlayer") or {}
-    local fallback = nil
-    local controlled = nil
     for _, actor in ipairs(all) do
         if isLive(actor) then
             local name = safe(function() return actor:GetFullName() end, "") or ""
             if not string.find(name, "Default__", 1, true) then
-                fallback = fallback or actor
-                local id = asInt(safe(function() return actor.m_ePlayerID end, nil))
                 local localOk = safe(function() return actor:IsLocallyControlled() end, false) == true
-                if localOk and (id == nil or id == 0) then
-                    return actor
-                end
-                if localOk and not controlled then
-                    controlled = actor
+                if localOk then
+                    local id = playerId(actor)
+                    if id == 0 or id == 1 then
+                        byId[id] = actor
+                    elseif not loose then
+                        loose = actor
+                    end
                 end
             end
         end
     end
-    return controlled or fallback
+    if not isLive(byId[0]) and isLive(loose) then
+        byId[0] = loose
+    end
+    return byId
 end
 
-local function itemBonus()
-    local actor = playerActor()
+local function itemBonus(actor, board, playerNumber)
     if not isLive(actor) then
         if not playerLogged then
             playerLogged = true
@@ -419,11 +471,14 @@ local function itemBonus()
     elseif rate >= RATE_PLUS_ONE then
         bonus = 1
     end
-    if perfect ~= seenPerfect or great ~= seenGreat or bonus ~= seenBonus then
-        seenPerfect = perfect
-        seenGreat = great
-        seenBonus = bonus
-        log(string.format("perfect %d great %d time %.1f rate %.3f bonus +%d", perfect, great, rawSeconds, rate, bonus))
+    if perfect ~= board.seenPerfect or great ~= board.seenGreat or bonus ~= board.seenBonus then
+        board.seenPerfect = perfect
+        board.seenGreat = great
+        board.seenBonus = bonus
+        log(string.format(
+            "player %d perfect %d great %d time %.1f rate %.3f bonus +%d",
+            playerNumber, perfect, great, rawSeconds, rate, bonus
+        ))
     end
     return bonus
 end
@@ -436,10 +491,13 @@ local function findHud()
     return FindFirstOf("BP_2d_hud_C")
 end
 
-local function hideLabel()
-    pulseOn = false
-    if isLive(label) then
-        pcall(function() label:SetVisibility(1) end)
+local function hideBoard(board)
+    if not board then
+        return
+    end
+    board.bonus = nil
+    if isLive(board.widget) then
+        pcall(function() board.widget:SetVisibility(1) end)
     end
 end
 
@@ -450,18 +508,17 @@ local function removeStale(canvas)
     local count = tonumber(safe(function() return canvas:GetChildrenCount() end, 0)) or 0
     for index = count - 1, 0, -1 do
         local child = asWidget(safe(function() return canvas:GetChildAt(index) end, nil))
-        if isLive(child) and not sameObject(child, label) and widgetClass(child):find("TextBlock", 1, true) and isOurText(textOf(child)) then
+        if isLive(child) and not ownedLabel(child) and widgetClass(child):find("TextBlock", 1, true) and isOurText(textOf(child)) then
             pcall(function() child:SetVisibility(1) end)
             pcall(function() canvas:RemoveChild(child) end)
         end
     end
 end
 
-local function styleLabel(hud, widget)
-    if fontReady or not isLive(widget) then
+local function styleLabel(gauge, widget, board)
+    if board.fontReady or not isLive(widget) then
         return
     end
-    local gauge = isLive(hud) and hud.bp_parts_gauge_pc or nil
     local source = isLive(gauge) and gauge.text_pc_name or nil
     local ok = false
     if isLive(source) then
@@ -491,7 +548,7 @@ local function styleLabel(hud, widget)
         widget:SetShadowColorAndOpacity({ R = 0, G = 0, B = 0, A = 0.9 })
     end)
     if ok then
-        fontReady = true
+        board.fontReady = true
     end
 end
 
@@ -659,7 +716,7 @@ local function sweepStale()
     swept = true
     local all = FindAllOf("TextBlock") or {}
     for _, widget in ipairs(all) do
-        if isLive(widget) and not sameObject(widget, label) and isOurText(textOf(widget)) then
+        if isLive(widget) and not ownedLabel(widget) and isOurText(textOf(widget)) then
             local parent = parentOf(widget)
             pcall(function() widget:SetVisibility(1) end)
             if isLive(parent) then
@@ -695,13 +752,15 @@ local function applySlot(widget, anchors, x, y, alignX, alignY)
     end)
 end
 
-local function placeOnHud(hud, widget)
+local function placeOnHud(hud, widget, gauge)
     if not isLive(hud) or not isLive(widget) then
         return false
     end
     placeTries = placeTries + 1
     sweepStale()
-    local gauge = hud.bp_parts_gauge_pc
+    if not isLive(gauge) then
+        gauge = hud.bp_parts_gauge_pc
+    end
     local name = isLive(gauge) and gauge.text_pc_name or nil
     local face = safe(function()
         if isLive(gauge.still_face) then
@@ -723,10 +782,8 @@ local function placeOnHud(hud, widget)
         if not applySlot(widget, anchors, x, y, alignX, alignY) then
             return false
         end
-        -- The portrait row stretches sideways, so a slot X offset stays put.
-        -- Shift the text itself.
         pcall(function()
-            widget:SetRenderTranslation({ X = NUDGE_X, Y = 0.0 })
+            widget:SetRenderTranslation({ X = 0.0, Y = NUDGE_Y })
         end)
         local box = safe(function() return gauge.InvalidationBox_0 end, nil)
         if isLive(box) then
@@ -743,7 +800,7 @@ local function placeOnHud(hud, widget)
     -- sits just above the portrait and grows upward.
     if isLive(canvas) and isLive(face) and geoState ~= "unsupported" then
         local x, y, w, h = markerRect(canvas, face)
-        if x and w <= 280 and h <= 280 then
+        if x and w >= 8 and h >= 8 and w <= 280 and h <= 280 then
             return finish(canvas, zeroAnchors(), x, y + 2, "above portrait", 0.0, 1.0)
         end
     end
@@ -754,6 +811,18 @@ local function placeOnHud(hud, widget)
             local left, top, sizeX, sizeY = slotTopLeft(anchorSlot)
             if sizeY >= 8 and sizeX >= 8 and sizeX <= 280 and sizeY <= 280 and left >= -30 and top >= -30 and left <= 1600 and top <= 1000 then
                 return finish(host, anchorSlot:GetAnchors(), left, top + 2, "above portrait slot", 0.0, 1.0)
+            end
+        end
+    end
+    -- Split-screen gauges have no portrait. The name is the row that remains.
+    if isLive(name) then
+        local nameHost, anchor = nearestCanvas(name)
+        local anchorSlot = isLive(anchor) and anchor.Slot or nil
+        if isLive(nameHost) and isLive(anchorSlot) then
+            local left, top, sizeX, sizeY = slotTopLeft(anchorSlot)
+            local laidOut = sizeX >= 8 or sizeY >= 8 or math.abs(left) > 4 or math.abs(top) > 4
+            if laidOut and left >= -80 and top >= -80 and left <= 2000 and top <= 1400 then
+                return finish(nameHost, anchorSlot:GetAnchors(), left, top, "above name", 0.0, 1.0)
             end
         end
     end
@@ -776,74 +845,194 @@ local function placeOnHud(hud, widget)
     return false
 end
 
-local function ensureLabel(hud)
-    local hudKey = safe(function() return hud:GetAddress() end, hud)
-    if isLive(label) and placedFor == hudKey and isLive(parentOf(label)) then
-        if not fontReady then
-            styleLabel(hud, label)
+local function ensureLabel(host, gauge, board)
+    local hudKey = safe(function() return gauge:GetAddress() end, host)
+    if isLive(board.widget) and board.placedFor == hudKey and isLive(parentOf(board.widget)) then
+        if not board.fontReady then
+            styleLabel(gauge, board.widget, board)
         end
-        return label
+        return board.widget
     end
-    placedFor = nil
-    if not isLive(label) then
+    board.placedFor = nil
+    if not isLive(board.widget) then
         local class = StaticFindObject("/Script/UMG.TextBlock")
-        local widget = class and StaticConstructObject(class, hud) or nil
+        local outer = isLive(gauge) and gauge or host
+        local widget = class and StaticConstructObject(class, outer) or nil
         if not isLive(widget) then
             return nil
         end
-        label = widget
-        fontReady = false
+        board.widget = widget
+        board.fontReady = false
         pcall(function() widget:SetVisibility(4) end)
     end
-    if placeOnHud(hud, label) then
-        placedFor = hudKey
-        styleLabel(hud, label)
-        paintLeft = 8
+    if placeOnHud(host, board.widget, gauge) then
+        board.placedFor = hudKey
+        styleLabel(gauge, board.widget, board)
+        board.paintLeft = 8
     end
-    return label
+    return board.widget
+end
+
+local splitLogged = false
+
+local function liveMulti()
+    local all = FindAllOf("BP_2d_hud_multi_C") or {}
+    for _, hud in ipairs(all) do
+        if isLive(hud) then
+            local name = safe(function() return hud:GetFullName() end, "") or ""
+            if not string.find(name, "Default__", 1, true) and shown(hud) then
+                return hud
+            end
+        end
+    end
+    return nil
+end
+
+-- Top half is player 1. Bottom half is player 2. Solo keeps the single gauge.
+local function gaugeRows()
+    local multi = liveMulti()
+    if isLive(multi) then
+        local up = asWidget(safe(function() return multi.BP_parts_2d_hud_split_screen_up end, nil))
+        local down = asWidget(safe(function() return multi.BP_parts_2d_hud_split_screen_down end, nil))
+        local upGauge = isLive(up) and asWidget(safe(function() return up.bp_parts_gauge_pc_multi end, nil)) or nil
+        local downGauge = isLive(down) and asWidget(safe(function() return down.bp_parts_gauge_pc_multi end, nil)) or nil
+        if isLive(upGauge) and isLive(downGauge) and shown(up) and shown(down) and shown(upGauge) and shown(downGauge) then
+            if not splitLogged then
+                splitLogged = true
+                log("split gauges")
+            end
+            return {
+                { id = 0, host = up, gauge = upGauge },
+                { id = 1, host = down, gauge = downGauge },
+            }
+        end
+    end
+    local hud = findHud()
+    if isLive(hud) and shown(hud) then
+        local gauge = asWidget(safe(function() return hud.bp_parts_gauge_pc end, nil))
+        if isLive(gauge) then
+            return {
+                { id = 0, host = hud, gauge = gauge },
+            }
+        end
+    end
+    return {}
 end
 
 local function refresh()
-    local hud = findHud()
-    if not isLive(hud) or not shown(hud) then
-        hideLabel()
-        return
-    end
-    local bonus = itemBonus()
-    if bonus == nil then
-        hideLabel()
-        return
-    end
-    local widget = ensureLabel(hud)
-    if not isLive(widget) then
-        pulseOn = false
-        return
-    end
-    local text = bonusText(bonus)
-    if textOf(widget) ~= text then
-        setWidgetText(widget, text)
-        if paintLeft < 3 then
-            paintLeft = 3
+    local players = localPlayers()
+    local rows = gaugeRows()
+    local seen = {}
+    pulseOn = false
+    for _, row in ipairs(rows) do
+        seen[row.id] = true
+        local board = boardFor(row.id)
+        local bonus = itemBonus(players[row.id], board, row.id + 1)
+        if bonus == nil or not shown(row.gauge) then
+            hideBoard(board)
+        else
+            local widget = ensureLabel(row.host, row.gauge, board)
+            if isLive(widget) then
+                local text = bonusText(bonus)
+                if textOf(widget) ~= text then
+                    setWidgetText(widget, text)
+                    if board.paintLeft < 3 then
+                        board.paintLeft = 3
+                    end
+                end
+                local flashing = tintLabel(widget, bonus)
+                board.bonus = bonus
+                if flashing then
+                    pulseOn = true
+                end
+                pcall(function()
+                    widget:SetVisibility(4)
+                    widget:SetRenderOpacity(1)
+                end)
+                if board.paintLeft > 0 then
+                    paintLabel(widget)
+                    board.paintLeft = board.paintLeft - 1
+                end
+            end
         end
     end
-    local flashing = tintLabel(widget, bonus)
-    pulseOn = flashing
-    pcall(function()
-        widget:SetVisibility(4)
-        widget:SetRenderOpacity(1)
-    end)
-    if paintLeft > 0 then
-        paintLabel(widget)
-        paintLeft = paintLeft - 1
+    for id, board in pairs(boards) do
+        if not seen[id] then
+            hideBoard(board)
+        end
     end
 end
 
 log("loaded")
 
+local pulseLogged = false
+local lastPulseDraw = 0
+local pulseHooks = {}
+
+local function pulseDraw()
+    if not pulseOn then
+        return
+    end
+    local now = os.clock()
+    if now - lastPulseDraw < 0.05 then
+        return
+    end
+    lastPulseDraw = now
+    for _, board in pairs(boards) do
+        if board.bonus == 2 and isLive(board.widget) then
+            local ok, err = pcall(function()
+                tintLabel(board.widget, 2)
+                paintLabel(board.widget)
+            end)
+            if not ok and not pulseLogged then
+                pulseLogged = true
+                log("pulse " .. tostring(err))
+            end
+        end
+    end
+end
+
+local function classReady(name)
+    local found = FindFirstOf(name)
+    return isLive(found)
+end
+
+local function ensurePulseHooks()
+    local paths = {
+        pc = {
+            className = "bp_parts_gauge_pc_C",
+            path = "/Game/UI/02_battle/bp_parts_gauge_pc.bp_parts_gauge_pc_C:Tick",
+        },
+        multi = {
+            className = "bp_parts_gauge_pc_multi_C",
+            path = "/Game/UI/02_battle/bp_parts_gauge_pc_multi.bp_parts_gauge_pc_multi_C:Tick",
+        },
+    }
+    for key, info in pairs(paths) do
+        if not pulseHooks[key] and classReady(info.className) then
+            local ok, err = pcall(function()
+                RegisterHook(info.path, function()
+                    pulseDraw()
+                end)
+            end)
+            if ok then
+                pulseHooks[key] = true
+                log("pulse hook " .. key)
+            elseif not pulseHooks[key .. "Logged"] then
+                pulseHooks[key .. "Logged"] = true
+                log("pulse hook " .. key .. " " .. tostring(err))
+            end
+        end
+    end
+end
+
 local loopOk, loopErr = pcall(function()
     LoopAsync(200, function()
         ExecuteInGameThread(function()
-            local ok, err = pcall(refresh)
+            local ok, err = pcall(function()
+                ensurePulseHooks()
+                refresh()
+            end)
             if not ok and not refreshLogged then
                 refreshLogged = true
                 log("refresh " .. tostring(err))
@@ -853,33 +1042,4 @@ local loopOk, loopErr = pcall(function()
 end)
 if not loopOk then
     log("loop " .. tostring(loopErr))
-end
-
--- One hook for the life of the script. The portrait gauge tick is already on the
--- game thread, so this does not queue a new callback every flash step. It stops
--- the moment the word leaves Peerless, including when a rank decays.
-local pulseLogged = false
-local lastPulseDraw = 0
-local pulseOk, pulseErr = pcall(function()
-    RegisterHook("/Game/UI/02_battle/bp_parts_gauge_pc.bp_parts_gauge_pc_C:Tick", function()
-        if not pulseOn or not isLive(label) then
-            return
-        end
-        local now = os.clock()
-        if now - lastPulseDraw < 0.05 then
-            return
-        end
-        lastPulseDraw = now
-        local ok, err = pcall(function()
-            tintLabel(label, 2)
-            paintLabel(label)
-        end)
-        if not ok and not pulseLogged then
-            pulseLogged = true
-            log("pulse " .. tostring(err))
-        end
-    end)
-end)
-if not pulseOk then
-    log("pulse " .. tostring(pulseErr))
 end

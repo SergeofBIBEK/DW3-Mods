@@ -1,6 +1,11 @@
 -- Drop Viewer
--- Battle gauge: drop name under the officer portrait. A combo note (8+/16+/24+)
--- sits on the next line, in the troop-line color, only when that drop can rise a tier.
+-- Battle gauge: in single player the drop sits under the portrait. In split
+-- screen that gauge has no portrait, so the drop sits under the morale stars,
+-- 12 px to the left.
+-- When neither slot is ready it sits under the officer name.
+-- A combo note (8+/16+/24+) sits on the next line, in the troop-line color,
+-- only when that drop can rise a tier.
+-- Split screen uses each player's own target gauge. The top half is player 1.
 -- Assigned drops live on the AlgoManager record array.
 --   character +0x7A0 = record index
 --   character +0x7A4 = -1 when this actor emits that record
@@ -398,12 +403,7 @@ end
 local PANE_MARK = " | "
 local COMBO_MARK = " · "
 local setTextFailed = false
-local comboText = nil
-local comboHintText = nil
-local comboFontReady = false
-local comboHintFontReady = false
-local comboPlaced = false
-local hintPlaced = false
+local panes = {}
 local comboLineSize = nil
 local comboMissLogged = false
 local portraitMissLogged = false
@@ -442,8 +442,17 @@ local function sameObject(a, b)
     return a == b
 end
 
-local function styleComboText(gauge, widget)
-    if comboFontReady then
+local function isPaneWidget(widget)
+    for _, state in pairs(panes) do
+        if sameObject(widget, state.drop) or sameObject(widget, state.hint) then
+            return true
+        end
+    end
+    return false
+end
+
+local function styleComboText(gauge, widget, state)
+    if state.fontReady then
         return
     end
     local name = gauge.text_enemy_name
@@ -465,7 +474,7 @@ local function styleComboText(gauge, widget)
         end
     end)
     if ok then
-        comboFontReady = true
+        state.fontReady = true
         return
     end
     if not setTextFailed then
@@ -474,8 +483,8 @@ local function styleComboText(gauge, widget)
     end
 end
 
-local function styleHintText(gauge, widget)
-    if comboHintFontReady then
+local function styleHintText(gauge, widget, state)
+    if state.hintReady then
         return
     end
     local name = gauge.text_enemy_name
@@ -498,7 +507,7 @@ local function styleHintText(gauge, widget)
         end
     end)
     if ok then
-        comboHintFontReady = true
+        state.hintReady = true
         return
     end
     if not setTextFailed then
@@ -521,6 +530,16 @@ local function widgetKey(widget)
         return string.format("%.0f", addr)
     end
     return tostring(widget)
+end
+
+local function paneState(gauge)
+    local key = widgetKey(gauge)
+    local state = panes[key]
+    if not state then
+        state = {}
+        panes[key] = state
+    end
+    return state
 end
 
 local function asWidget(value)
@@ -576,7 +595,7 @@ local function clearStarNotes(gauge)
     local seen = {}
     eachChild(box, function(child)
         local keyChild = widgetKey(child)
-        if seen[keyChild] or sameObject(child, comboText) or sameObject(child, comboHintText) then
+        if seen[keyChild] or isPaneWidget(child) then
             return
         end
         seen[keyChild] = true
@@ -705,6 +724,174 @@ local function attachPortrait(widget, marker, above, nudge, extraY)
     return placed
 end
 
+-- Fallback when the portrait and the star row are both missing.
+local function attachUnderName(widget, name, extraY, xShift)
+    if not isLive(widget) or not isLive(name) then
+        return false
+    end
+    local canvas, anchor = portraitCanvas(name)
+    if not isLive(canvas) or not isLive(anchor) then
+        return false
+    end
+    if not sameObject(parentOf(widget), canvas) then
+        local old = parentOf(widget)
+        if isLive(old) then
+            pcall(function() old:RemoveChild(widget) end)
+        end
+        local added = safe(function() return canvas:AddChildToCanvas(widget) end, nil)
+        if not isLive(added) then
+            return false
+        end
+    end
+    local slot = widget.Slot
+    local anchorSlot = anchor.Slot
+    if not isLive(slot) or not isLive(anchorSlot) then
+        return false
+    end
+    local placed = false
+    pcall(function()
+        local posX, posY = vec2(anchorSlot:GetPosition())
+        local sizeX, sizeY = vec2(anchorSlot:GetSize())
+        local alignX, alignY = vec2(safe(function() return anchorSlot:GetAlignment() end, nil))
+        local fontSize = tonumber(safe(function() return name.Font.Size end, nil))
+        if sizeY < 8 then
+            sizeY = fontSize and fontSize > 8 and fontSize or 22
+        end
+        if sizeX < 8 then
+            sizeX = 8
+        end
+        local left = posX - alignX * sizeX
+        local top = posY - alignY * sizeY
+        local extra = tonumber(extraY) or 0
+        local slide = tonumber(xShift) or 0
+        slot:SetAutoSize(true)
+        slot:SetAnchors(anchorSlot:GetAnchors())
+        slot:SetAlignment({ X = 0.0, Y = 0.0 })
+        slot:SetPosition({
+            X = left + slide,
+            Y = top + sizeY + 2 + extra,
+        })
+        slot:SetZOrder((tonumber(safe(function() return anchorSlot:GetZOrder() end, 0)) or 0) + 5)
+        placed = true
+    end)
+    return placed
+end
+
+-- The star box's own canvas is often an empty inner slot. Keep walking
+-- until a canvas slot has a real size, and prefer the one that shares the
+-- officer name's canvas and sits at or below that name.
+local function canvasRect(marker, stopAt)
+    local found = {}
+    local current = marker
+    for _ = 1, 12 do
+        if stopAt and sameObject(current, stopAt) then
+            break
+        end
+        local parent = parentOf(current)
+        if not isLive(parent) then
+            break
+        end
+        if widgetClass(parent):find("CanvasPanel", 1, true) and isLive(current.Slot) then
+            local slot = current.Slot
+            local posX, posY = vec2(safe(function() return slot:GetPosition() end, nil))
+            local sizeX, sizeY = vec2(safe(function() return slot:GetSize() end, nil))
+            local h = sizeY
+            if h >= 8 or math.abs(posX) > 4 or math.abs(posY) > 4 then
+                local alignX, alignY = vec2(safe(function() return slot:GetAlignment() end, nil))
+                local w = sizeX >= 8 and sizeX or 8
+                local drawH = h >= 8 and h or 16
+                local left = posX - alignX * w
+                local top = posY - alignY * drawH
+                found[#found + 1] = {
+                    canvas = parent,
+                    slot = slot,
+                    left = left,
+                    bottom = top + drawH,
+                }
+            end
+        end
+        current = parent
+    end
+    return found
+end
+
+local function pickStarRect(gauge)
+    local morale = isLive(gauge) and asWidget(safe(function() return gauge.BP_parts_enemy_morale end, nil)) or nil
+    if not isLive(morale) then
+        return nil
+    end
+    local box = asWidget(safe(function() return morale.box_star end, nil))
+    local rects = canvasRect(isLive(box) and box or morale, gauge)
+    if #rects == 0 and isLive(box) then
+        rects = canvasRect(morale, gauge)
+    end
+    if #rects == 0 then
+        return nil
+    end
+    local name = isLive(gauge) and gauge.text_enemy_name or nil
+    local nameRects = isLive(name) and canvasRect(name, gauge) or {}
+    local nameRect = nameRects[1]
+    if nameRect then
+        for _, rect in ipairs(rects) do
+            if sameObject(rect.canvas, nameRect.canvas) and rect.bottom >= nameRect.bottom - 2 then
+                return rect
+            end
+        end
+    end
+    return rects[#rects]
+end
+
+local starSlotLogged = false
+local starPlaceLogged = false
+
+local function attachUnderStars(gauge, widget, extraY, xShift)
+    if not isLive(widget) then
+        return false
+    end
+    local rect = pickStarRect(gauge)
+    if not rect then
+        if not starSlotLogged then
+            starSlotLogged = true
+            log("star slot missing")
+        end
+        return false
+    end
+    local canvas = rect.canvas
+    if not sameObject(parentOf(widget), canvas) then
+        local old = parentOf(widget)
+        if isLive(old) then
+            pcall(function() old:RemoveChild(widget) end)
+        end
+        local added = safe(function() return canvas:AddChildToCanvas(widget) end, nil)
+        if not isLive(added) then
+            return false
+        end
+    end
+    local slot = widget.Slot
+    if not isLive(slot) then
+        return false
+    end
+    local placed = false
+    pcall(function()
+        local extra = tonumber(extraY) or 0
+        local slide = tonumber(xShift) or 0
+        slot:SetAutoSize(true)
+        slot:SetAnchors(rect.slot:GetAnchors())
+        slot:SetAlignment({ X = 0.0, Y = 0.0 })
+        slot:SetPosition({
+            X = rect.left + slide,
+            Y = rect.bottom + 4 + extra,
+        })
+        slot:SetZOrder((tonumber(safe(function() return rect.slot:GetZOrder() end, 0)) or 0) + 5)
+        placed = true
+    end)
+    if placed and not starPlaceLogged then
+        starPlaceLogged = true
+        log(string.format("drop under morale stars y %.0f", rect.bottom))
+    end
+    return placed
+end
+
 local function gaugePortrait(gauge)
     if isLive(gauge.gauge_enemy_face_frame) then
         return gauge.gauge_enemy_face_frame
@@ -718,17 +905,70 @@ local function gaugePortrait(gauge)
     return nil
 end
 
-local function placeComboText(gauge, widget)
+local function portraitUsable(gauge)
     local portrait = gaugePortrait(gauge)
     if not isLive(portrait) then
+        return nil
+    end
+    local _, anchor = portraitCanvas(portrait)
+    local anchorSlot = isLive(anchor) and anchor.Slot or nil
+    if not isLive(anchorSlot) then
+        return nil
+    end
+    local sizeX, sizeY = vec2(safe(function() return anchorSlot:GetSize() end, nil))
+    if sizeX >= 8 and sizeY >= 8 then
+        return portrait
+    end
+    return nil
+end
+
+local function splitGauge(gauge)
+    return string.find(widgetClass(gauge), "gauge_enemy_multi", 1, true) ~= nil
+end
+
+local function splitDropX(gauge)
+    if splitGauge(gauge) then
+        return -12
+    end
+    return 0
+end
+
+local function placeComboText(gauge, widget)
+    local state = paneState(gauge)
+    if not splitGauge(gauge) then
+        local portrait = portraitUsable(gauge)
+        if isLive(portrait) and attachPortrait(widget, portrait, false, 8) then
+            return true
+        end
+        if isLive(gaugePortrait(gauge)) then
+            return false
+        end
+    end
+    local morale = isLive(gauge) and asWidget(safe(function() return gauge.BP_parts_enemy_morale end, nil)) or nil
+    if isLive(morale) then
+        if attachUnderStars(gauge, widget, 0, splitDropX(gauge)) then
+            if not comboMissLogged then
+                comboMissLogged = true
+                log("drop under morale stars")
+            end
+            return true
+        end
+        state.starTries = (state.starTries or 0) + 1
+        if state.starTries < 10 then
+            return false
+        end
+    end
+    local name = isLive(gauge) and gauge.text_enemy_name or nil
+    if isLive(name) and attachUnderName(widget, name, 0, splitDropX(gauge)) then
         if not comboMissLogged then
             comboMissLogged = true
-            log("combo portrait missing")
+            log("drop under officer name")
         end
-        return false
-    end
-    if attachPortrait(widget, portrait, false, 8) then
         return true
+    end
+    if not comboMissLogged then
+        comboMissLogged = true
+        log("combo portrait missing")
     end
     return false
 end
@@ -761,60 +1001,85 @@ local function placeComboHint(gauge, widget)
     if not step or not isLive(widget) then
         return false
     end
-    local portrait = gaugePortrait(gauge)
-    if not isLive(portrait) then
-        return false
+    if not splitGauge(gauge) then
+        local portrait = portraitUsable(gauge)
+        if isLive(portrait) then
+            return attachPortrait(widget, portrait, false, 8, step + 8)
+        end
+        if isLive(gaugePortrait(gauge)) then
+            return false
+        end
     end
-    return attachPortrait(widget, portrait, false, 8, step + 8)
+    local morale = isLive(gauge) and asWidget(safe(function() return gauge.BP_parts_enemy_morale end, nil)) or nil
+    if isLive(morale) then
+        if attachUnderStars(gauge, widget, step + 8, splitDropX(gauge)) then
+            return true
+        end
+        local state = paneState(gauge)
+        if (state.starTries or 0) < 10 then
+            return false
+        end
+    end
+    local name = isLive(gauge) and gauge.text_enemy_name or nil
+    if isLive(name) then
+        return attachUnderName(widget, name, step + 8, splitDropX(gauge))
+    end
+    return false
 end
 
 local function ensureComboText(gauge)
     clearStarNotes(gauge)
-    if comboPlaced and isLive(comboText) and isLive(parentOf(comboText)) then
-        if not comboFontReady then
-            styleComboText(gauge, comboText)
+    local state = paneState(gauge)
+    if state.placed and isLive(state.drop) and isLive(parentOf(state.drop)) then
+        if not state.fontReady then
+            styleComboText(gauge, state.drop, state)
         end
-        return comboText
+        -- The first frames often have no star size. Keep moving the slot
+        -- so a name placement does not stay above the stars.
+        placeComboText(gauge, state.drop)
+        return state.drop
     end
-    comboPlaced = false
-    if not isLive(comboText) then
+    state.placed = false
+    if not isLive(state.drop) then
         local class = StaticFindObject("/Script/UMG.TextBlock")
         local widget = class and StaticConstructObject(class, gauge) or nil
         if not isLive(widget) then
             return nil
         end
-        comboText = widget
-        comboFontReady = false
+        state.drop = widget
+        state.fontReady = false
     end
-    if placeComboText(gauge, comboText) then
-        comboPlaced = true
-        styleComboText(gauge, comboText)
+    if placeComboText(gauge, state.drop) then
+        state.placed = true
+        styleComboText(gauge, state.drop, state)
     end
-    return comboText
+    return state.drop
 end
 
 local function ensureComboHint(gauge)
-    if hintPlaced and isLive(comboHintText) and isLive(parentOf(comboHintText)) then
-        if not comboHintFontReady then
-            styleHintText(gauge, comboHintText)
+    local state = paneState(gauge)
+    if state.hintPlaced and isLive(state.hint) and isLive(parentOf(state.hint)) then
+        if not state.hintReady then
+            styleHintText(gauge, state.hint, state)
         end
-        return comboHintText
+        placeComboHint(gauge, state.hint)
+        return state.hint
     end
-    hintPlaced = false
-    if not isLive(comboHintText) then
+    state.hintPlaced = false
+    if not isLive(state.hint) then
         local class = StaticFindObject("/Script/UMG.TextBlock")
         local widget = class and StaticConstructObject(class, gauge) or nil
         if not isLive(widget) then
             return nil
         end
-        comboHintText = widget
-        comboHintFontReady = false
+        state.hint = widget
+        state.hintReady = false
     end
-    if placeComboHint(gauge, comboHintText) then
-        hintPlaced = true
-        styleHintText(gauge, comboHintText)
+    if placeComboHint(gauge, state.hint) then
+        state.hintPlaced = true
+        styleHintText(gauge, state.hint, state)
     end
-    return comboHintText
+    return state.hint
 end
 
 -- The first combo note scaled text_enemy_force to 0.75 and appended " · 8+".
@@ -867,7 +1132,7 @@ local function removeStaleNotes(gauge)
     local removed = 0
     local seen = {}
     local function consider(widget)
-        if not isLive(widget) or sameObject(widget, comboText) or sameObject(widget, comboHintText) or sameObject(widget, name) or sameObject(widget, force) then
+        if not isLive(widget) or isPaneWidget(widget) or sameObject(widget, name) or sameObject(widget, force) then
             return
         end
         if not widgetClass(widget):find("TextBlock", 1, true) then
@@ -1045,9 +1310,7 @@ local function findHud()
     return FindFirstOf("BP_2d_hud_C")
 end
 
-local function applyPane(label, hint, actorKey)
-    local hud = findHud()
-    local gauge = isLive(hud) and hud.BP_parts_gauge_enemy or nil
+local function applyPane(gauge, label, hint, actorKey)
     if not isLive(gauge) then
         return
     end
@@ -1122,8 +1385,77 @@ local function emittingActor(actor)
     return nil
 end
 
+local function playerIdOf(actor)
+    local value = safe(function() return actor.m_ePlayerID end, nil)
+    if type(value) == "number" then
+        return math.floor(value)
+    end
+    local inner = safe(function()
+        if value and value.get then
+            return value:get()
+        end
+        return nil
+    end, nil)
+    if type(inner) == "number" then
+        return math.floor(inner)
+    end
+    local text = safe(function()
+        if value and value.ToString then
+            return value:ToString()
+        end
+        return tostring(value)
+    end, "") or ""
+    if string.find(text, "PLAYER2", 1, true) then
+        return 1
+    end
+    if string.find(text, "PLAYER1", 1, true) then
+        return 0
+    end
+    return nil
+end
+
+local function localPlayers()
+    local byId = {}
+    local all = FindAllOf("AppCharacterPlayer") or {}
+    for _, actor in ipairs(all) do
+        if isLive(actor) then
+            local name = safe(function() return actor:GetFullName() end, "") or ""
+            if not string.find(name, "Default__", 1, true) then
+                local localOk = safe(function() return actor:IsLocallyControlled() end, false) == true
+                if localOk then
+                    local id = playerIdOf(actor)
+                    if id == 0 or id == 1 then
+                        byId[id] = actor
+                    end
+                end
+            end
+        end
+    end
+    return byId
+end
+
+local function lockEmitter(actor)
+    if not isLive(actor) then
+        return nil
+    end
+    local camera = safe(function() return actor.ATPCCamera end, nil)
+    if not isLive(camera) then
+        return nil
+    end
+    local lockObj = safe(function() return camera:GetCameraLockOnTargetObject() end, nil)
+    local lockOn = isLive(lockObj) and safe(function() return lockObj:GetTargetActor() end, nil) or nil
+    if isLive(lockOn) and asInt(lockOn.DropOwnerGate) == -1 then
+        return lockOn
+    end
+    return nil
+end
+
 local function currentEmitter()
-    local player = FindFirstOf("AppCharacterPlayer")
+    local players = localPlayers()
+    local player = players[0]
+    if not isLive(player) then
+        player = FindFirstOf("AppCharacterPlayer")
+    end
     if isLive(player) and isLive(player.ATPCCamera) then
         local lockObj = safe(function() return player.ATPCCamera:GetCameraLockOnTargetObject() end, nil)
         local lockOn = isLive(lockObj) and safe(function() return lockObj:GetTargetActor() end, nil) or nil
@@ -1139,23 +1471,62 @@ local function currentEmitter()
     return emittingActor(gaugeUnit)
 end
 
-local function refreshLabel()
-    local label = nil
-    local hint = nil
-    local actorKey = ""
-    if dropCache then
-        local actor = currentEmitter()
-        if isLive(actor) then
-            actorKey = widgetKey(actor)
-            local index = asInt(safe(function() return actor.DropRecordIndex end, nil))
-            local raw = index and dropCache.items[index] or nil
-            if raw ~= nil then
-                label = itemLabel(raw)
-                hint = comboHint(raw)
+local splitDropLogged = false
+
+local function enemyRows()
+    local all = FindAllOf("BP_2d_hud_multi_C") or {}
+    for _, hud in ipairs(all) do
+        if isLive(hud) then
+            local name = safe(function() return hud:GetFullName() end, "") or ""
+            if not string.find(name, "Default__", 1, true) and gaugeShown(hud) then
+                local up = asWidget(safe(function() return hud.BP_parts_2d_hud_split_screen_up end, nil))
+                local down = asWidget(safe(function() return hud.BP_parts_2d_hud_split_screen_down end, nil))
+                local upGauge = isLive(up) and asWidget(safe(function() return up.BP_parts_gauge_enemy_multi end, nil)) or nil
+                local downGauge = isLive(down) and asWidget(safe(function() return down.BP_parts_gauge_enemy_multi end, nil)) or nil
+                if isLive(upGauge) and isLive(downGauge) and gaugeShown(up) and gaugeShown(down) then
+                    if not splitDropLogged then
+                        splitDropLogged = true
+                        log("split gauges")
+                    end
+                    return {
+                        { id = 0, gauge = upGauge },
+                        { id = 1, gauge = downGauge },
+                    }
+                end
             end
         end
     end
-    applyPane(label, hint, actorKey)
+    local hud = findHud()
+    local gauge = isLive(hud) and asWidget(hud.BP_parts_gauge_enemy) or nil
+    if isLive(gauge) then
+        return { { id = 0, gauge = gauge } }
+    end
+    return {}
+end
+
+local function dropFor(actor)
+    if not dropCache or not isLive(actor) then
+        return nil, nil, ""
+    end
+    local actorKey = widgetKey(actor)
+    local index = asInt(safe(function() return actor.DropRecordIndex end, nil))
+    local raw = index and dropCache.items[index] or nil
+    if raw == nil then
+        return nil, nil, actorKey
+    end
+    return itemLabel(raw), comboHint(raw), actorKey
+end
+
+local function refreshLabel()
+    local players = localPlayers()
+    for _, row in ipairs(enemyRows()) do
+        local actor = lockEmitter(players[row.id])
+        if not isLive(actor) and row.id == 0 then
+            actor = currentEmitter()
+        end
+        local label, hint, actorKey = dropFor(actor)
+        applyPane(row.gauge, label, hint, actorKey or "")
+    end
 end
 
 local paneFailed = false
